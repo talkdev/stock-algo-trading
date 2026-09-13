@@ -11,11 +11,28 @@ from __future__ import annotations
 import math
 import os
 import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+def _bootstrap_path() -> str:
+    """Directory to import `jfou` from, found by walking up from __file__.
+
+    A hard-coded parent-of-parent only happens to be right for one layout; this works
+    from tests/, from the project root, from a symlinked checkout and from any working
+    directory on either OS.
+    """
+    here = Path(__file__).resolve()
+    for cand in (here.parent, *here.parents):
+        if (cand / "jfou").is_dir() or (cand / "main.py").is_file():
+            return str(cand)
+    return str(here.parent)
+
+
+_ROOT = _bootstrap_path()
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 from jfou import indicators as I  # noqa: E402
 

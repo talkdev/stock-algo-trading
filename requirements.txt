@@ -13,3 +13,9 @@ scipy>=1.11
 requests>=2.31
 statsmodels>=0.14      # Augmented Dickey-Fuller (gate G4)
 arch>=6.0              # GARCH(1,1) conditional variance (confluence S1)
+
+# Windows has no IANA time-zone database of its own. Without tzdata,
+# zoneinfo.ZoneInfo("Asia/Kolkata") raises ZoneInfoNotFoundError at import time and
+# the session clock -- and with it every command -- is unavailable. clock.py degrades
+# to a fixed +05:30 offset if it is missing, but install it for the real thing.
+tzdata>=2023.3         # IANA tz database for Windows (a no-op on Linux/macOS)

@@ -6,13 +6,65 @@ reader can audit the reasoning without opening the database.
 """
 from __future__ import annotations
 
+import os
 import shutil
 import sys
 from datetime import datetime
 
-W = max(78, min(shutil.get_terminal_size((100, 24)).columns - 2, 118))
 
-_TTY = sys.stdout.isatty()
+def _width() -> int:
+    """A report width that survives a redirect, a service and CI.
+
+    A detached or absent console reports 0 columns; a negative width then makes every
+    ljust()/wrap() raise inside print(), far from the code that caused it.
+    """
+    cols = 0
+    try:
+        env = os.environ.get("COLUMNS")
+        cols = int(env) if env else int(shutil.get_terminal_size((100, 24)).columns)
+    except Exception:
+        cols = 0
+    if cols < 40:
+        cols = 100
+    return max(78, min(cols - 2, 118))
+
+
+W = _width()
+
+
+def _ansi_ok() -> bool:
+    """True only when writing escape sequences to this stream is both possible and wanted."""
+    stream = getattr(sys, "stdout", None)
+    if stream is None or not hasattr(stream, "isatty"):
+        return False                    # pythonw.exe / GUI launch: no stdout at all
+    try:
+        if not stream.isatty():
+            return False                # redirected to a file or a pipe
+    except Exception:
+        return False
+    if os.environ.get("NO_COLOR") or os.environ.get("JFOU_COLOR") == "0":
+        return False
+    if os.environ.get("TERM", "").lower() == "dumb":
+        return False
+    if os.name != "nt":
+        return True
+    # A legacy Windows console renders \x1b[32m as literal garbage. Ask conhost for
+    # virtual-terminal processing and stay monochrome if it refuses.
+    try:
+        import ctypes
+        kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(-11)          # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint32()
+        if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False
+        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
+        return bool(kernel32.SetConsoleMode(
+            handle, mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING))
+    except Exception:
+        return False
+
+
+_TTY = _ansi_ok()
 
 
 def _c(code: str, s: str) -> str:
@@ -74,12 +126,35 @@ def gate_line(gate: str, ok: bool | None, headline: str, why: str = "") -> None:
             print(" " * 25 + grey(chunk) if i else " " * 25 + grey(chunk))
 
 
+def _fmt(text: str, indent) -> tuple[str, int]:
+    """Accept warn("label", "detail") as well as warn(text, indent=4).
+
+    engine.py calls these helpers as `con.warn(f"{sym} CANCEL_GAP", why)`, passing a
+    detail string in the indent slot. `" " * <str>` raised TypeError, so a
+    gap-cancel or a GFD expiry -- the two events an operator most needs reported --
+    killed the whole position-management pass. A str second argument is now appended
+    as detail; anything non-numeric falls back to the default indent.
+    """
+    if isinstance(indent, str):
+        detail = indent.strip()
+        if detail:
+            text = f"{text}  |  {detail}" if text else detail
+        indent = 2
+    try:
+        indent = max(0, int(indent))
+    except (TypeError, ValueError):
+        indent = 2
+    return text, indent
+
+
 def note(text: str, indent: int = 2) -> None:
+    text, indent = _fmt(text, indent)
     for chunk in _wrap(text, W - indent - 2):
         print(" " * indent + grey(chunk))
 
 
 def warn(text: str, indent: int = 2) -> None:
+    text, indent = _fmt(text, indent)
     for i, chunk in enumerate(_wrap(text, W - indent - 2)):
         print(" " * indent + (amber("! " + chunk) if i == 0 else amber(chunk)))
 

@@ -15,9 +15,37 @@ from pathlib import Path
 LAKH = 100_000
 CRORE = 10_000_000
 
-BASE_DIR = Path(os.environ.get("JFOU_HOME", Path(__file__).resolve().parent.parent))
-DB_PATH = Path(os.environ.get("JFOU_DB", BASE_DIR / "data" / "jfou.sqlite3"))
-LOG_DIR = BASE_DIR / "logs"
+# --------------------------------------------------------------------- locations
+# Nothing here is derived from the working directory and nothing assumes a fixed
+# nesting depth. PKG_DIR is this file; ROOT_DIR is its parent. That holds on
+# /home/me/stock-algo-trading, on C:\Users\me\stock-algo-trading, on a mapped drive,
+# and inside a zip-imported copy, and both slash directions resolve to the same place
+# because pathlib joins with the host separator.
+PKG_DIR = Path(__file__).resolve().parent          # <root>/jfou
+ROOT_DIR = PKG_DIR.parent                            # <root>
+
+
+def _path_from(raw, default: Path) -> Path:
+    """Resolve a user-supplied path, falling back to `default`.
+
+    Set-but-empty must behave like unset. On Windows an undefined %JFOU_HOME%
+    expands to "", and Path("") / "data" is drive-relative, which is how the state
+    database ends up next to the drive root instead of inside the project. Quoted
+    values (a path containing spaces) and ~ are accepted, and the result is
+    normalised for the host OS, so both slash directions work.
+    """
+    if raw is None or not str(raw).strip():
+        return Path(default)
+    p = Path(os.path.normpath(os.path.expandvars(str(raw)).strip().strip('"')))
+    p = p.expanduser()
+    if not p.is_absolute():
+        p = Path(os.path.normpath(str(Path.cwd() / p)))
+    return p
+
+
+BASE_DIR = _path_from(os.environ.get("JFOU_HOME"), ROOT_DIR)
+DB_PATH = _path_from(os.environ.get("JFOU_DB"), BASE_DIR / "data" / "jfou.sqlite3")
+LOG_DIR = _path_from(os.environ.get("JFOU_LOG_DIR"), BASE_DIR / "logs")
 
 
 @dataclass(frozen=True)
@@ -161,3 +189,46 @@ class Config:
 
 
 CFG = Config()
+
+# --------------------------------------------------------------------- locators
+def resolve_universe_file(name_or_path: str | None = None,
+                          roots: tuple = ()) -> Path:
+    """Locate the universe JSON without assuming a working directory.
+
+    An absolute path is honoured exactly as given, so a Windows drive path, a POSIX
+    `/srv/jfou/universe.json` and a `~`-relative path all work. A bare file name is
+    searched in the project root, then under data/, then beside the package, then in
+    the current directory -- the first hit wins. When nothing matches, the primary
+    candidate is returned so the caller can report the exact path it wanted.
+    """
+    raw = str(name_or_path or CFG.universe_file)
+    # Not _path_from(): that helper makes a relative path absolute against the cwd,
+    # which would defeat the whole point of searching the roots below.
+    p = Path(os.path.normpath(os.path.expandvars(raw).strip().strip('"'))).expanduser()
+    if p.is_absolute():
+        return p
+    bases: list = []
+    for b in tuple(roots) + (ROOT_DIR, BASE_DIR, PKG_DIR, Path.cwd()):
+        b = Path(b)
+        if b not in bases:
+            bases.append(b)
+    for b in bases:
+        for cand in (b / p, b / "data" / p, b / "jfou" / p, b / "tests" / p):
+            if cand.is_file():
+                return cand
+    return bases[0] / p
+
+
+def ensure_dirs() -> None:
+    """Create data/ and logs/ for the resolved config.
+
+    mkdir(parents=True, exist_ok=True) is the race-safe form: on Windows another
+    process (an editor, a second scan, a scheduled task) may create the directory
+    between the existence check and the call.
+    """
+    for d in (DB_PATH.parent, LOG_DIR):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except OSError:            # read-only media: the DB may still open fine
+            pass
+

@@ -15,8 +15,18 @@ import sys
 import tempfile
 from pathlib import Path
 
-BASE = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(BASE))
+def _project_root() -> Path:
+    """First ancestor that holds main.py -- the root, whatever the layout depth is."""
+    here = Path(__file__).resolve()
+    for cand in (here.parent, *here.parents):
+        if (cand / "main.py").is_file():
+            return cand
+    return here.parent.parent
+
+
+BASE = _project_root()
+if str(BASE) not in sys.path:
+    sys.path.insert(0, str(BASE))
 
 FAILURES: list[str] = []
 
@@ -28,11 +38,21 @@ def check(name: str, ok: bool, detail: str = "") -> None:
 
 
 def run(home: str, *args: str, timeout: int = 1200) -> tuple[int, str]:
-    env = {**os.environ, "JFOU_HOME": home,
-           "JFOU_DB": str(Path(home) / "data" / "jfou.sqlite3")}
+    # JFOU_HOME is resolved to an absolute, canonical path: on Windows
+    # tempfile.mkdtemp() may hand back an 8.3 short path, and a short path plus a
+    # relative DB path is how two runs end up writing two different databases.
+    # text=True without an explicit encoding decodes the child with the ANSI
+    # codepage on Windows -- the reports use U+2500 and would raise there.
+    home_path = Path(home).expanduser().resolve()
+    env = dict(os.environ)
+    env.update({"JFOU_HOME": str(home_path),
+                "JFOU_DB": str(home_path / "data" / "jfou.sqlite3"),
+                "PYTHONUTF8": "1",
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONPATH": str(BASE)})
     p = subprocess.run([sys.executable, str(BASE / "main.py"), *args],
-                       capture_output=True, text=True, env=env, cwd=str(BASE),
-                       timeout=timeout)
+                       capture_output=True, text=True, encoding="utf-8",
+                       errors="replace", env=env, cwd=str(BASE), timeout=timeout)
     return p.returncode, p.stdout + p.stderr
 
 

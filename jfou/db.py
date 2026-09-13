@@ -19,6 +19,7 @@ Design rules that make the database safe:
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import threading
 from contextlib import contextmanager
@@ -290,7 +291,11 @@ class Database:
     """Thin, thread-safe wrapper over SQLite."""
 
     def __init__(self, path: str | Path):
-        self.path = Path(path)
+        # str or Path, POSIX or Windows separators, ~, %VAR%, quoted values. sqlite3
+        # is then handed a plain absolute str, because "unable to open database file"
+        # -- the most common first-run failure on a fresh checkout -- is almost always
+        # a relative path, a missing parent directory or a drive-relative one.
+        self.path = resolve_db_path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self._local = threading.local()
         self._write_lock = threading.Lock()
@@ -301,12 +306,27 @@ class Database:
     def conn(self) -> sqlite3.Connection:
         c = getattr(self._local, "conn", None)
         if c is None:
-            c = sqlite3.connect(self.path, timeout=30, isolation_level=None)
+            c = sqlite3.connect(str(self.path), timeout=30, isolation_level=None)
             c.row_factory = sqlite3.Row
-            c.execute("PRAGMA journal_mode=WAL")
-            c.execute("PRAGMA synchronous=NORMAL")
-            c.execute("PRAGMA foreign_keys=ON")
-            c.execute("PRAGMA busy_timeout=30000")
+            self.journal_mode = "delete"
+            for pragma, name in (("PRAGMA journal_mode=WAL", "wal"),
+                                 ("PRAGMA synchronous=NORMAL", None),
+                                 ("PRAGMA foreign_keys=ON", None),
+                                 ("PRAGMA busy_timeout=30000", None)):
+                try:
+                    c.execute(pragma)
+                except sqlite3.OperationalError:
+                    # WAL needs the directory to support the -shm/-wal lock files.
+                    # SMB, OneDrive and Google Drive folders -- the usual Windows
+                    # home for a checkout -- refuse it, and a refusal used to abort
+                    # every command. Degrade to the rollback journal instead: slower,
+                    # still crash-safe, still single-writer consistent.
+                    if name == "wal":
+                        try:
+                            c.execute("PRAGMA journal_mode=DELETE")
+                        except sqlite3.OperationalError:
+                            pass
+                    continue
             self._local.conn = c
         return c
 
@@ -487,6 +507,15 @@ class Database:
             "INSERT INTO position_events(position_id,ts,event,detail) VALUES(?,?,?,?)",
             (position_id, _now(), event, json.dumps(detail or {}, default=str)),
         )
+
+
+def resolve_db_path(path: "str | Path") -> Path:
+    """Absolute, OS-normalised, `~`/`%VAR%`-expanded view of a database path."""
+    raw = os.path.expandvars(str(path)).strip().strip('"')
+    p = Path(os.path.normpath(os.path.expanduser(raw)))
+    if not p.is_absolute():
+        p = Path(os.path.normpath(str(Path.cwd() / p)))
+    return p
 
 
 def _now() -> str:

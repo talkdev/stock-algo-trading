@@ -1,0 +1,14 @@
+# Windows checkouts: git must not rewrite bytes of the state database.
+# core.autocrlf=true turns data/jfou.sqlite3 into a corrupt file the moment it is
+# checked out, and text=auto would keep re-diffing every .py file on each commit.
+* text=auto
+
+*.py        text eol=lf
+*.json      text eol=lf
+*.md        text eol=lf
+*.txt       text eol=lf
+*.sqlite3   binary
+*.sqlite    binary
+*.db        binary
+*.gz        binary
+*.png       binary

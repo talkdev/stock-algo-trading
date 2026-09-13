@@ -1,10 +1,31 @@
 """IST clock and session-phase resolution (spec Part III)."""
 from __future__ import annotations
 
-from datetime import datetime, time, timedelta, date
-from zoneinfo import ZoneInfo
+from datetime import datetime, time, timedelta, date, timezone
 
-IST = ZoneInfo("Asia/Kolkata")
+
+def _ist_zone():
+    """Asia/Kolkata, with a fallback that cannot fail at import time.
+
+    Windows ships no IANA tz database, so a plain `ZoneInfo("Asia/Kolkata")` raises
+    ZoneInfoNotFoundError there and the whole program dies while importing this
+    module -- before a single line of strategy code runs. zoneinfo does consult the
+    `tzdata` wheel when it is installed (requirements.txt now asks for it), and if
+    neither source exists we fall back to the fixed +05:30 offset. India has had no
+    DST since 1945, so the fallback is exact rather than approximate and every
+    session-phase rule keeps its meaning.
+    """
+    try:
+        from zoneinfo import ZoneInfo
+    except ImportError:                       # Python < 3.9
+        return timezone(timedelta(hours=5, minutes=30), "IST")
+    try:
+        return ZoneInfo("Asia/Kolkata")
+    except Exception:
+        return timezone(timedelta(hours=5, minutes=30), "IST")
+
+
+IST = _ist_zone()
 
 
 def now_ist() -> datetime:
