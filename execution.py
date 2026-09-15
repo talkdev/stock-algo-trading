@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import config
 import db
+from mkttime import today_str
 
 
 def compute_fees(side: str, price: float, qty: int) -> dict:
@@ -130,6 +131,10 @@ class PaperBroker:
         return ((p["realized_pnl"] or 0.0) + (fill - p["entry_fill"]) * qty
                 - fees["total"] - (p["entry_fees"] or 0.0))
 
+    def sync_stop(self, pid: int, new_stop: float) -> None:
+        """No-op in paper mode (stops live only in the DB)."""
+        return None
+
 
 # ---------------------------------------------------------------------------
 class UpstoxBroker:
@@ -153,9 +158,38 @@ class UpstoxBroker:
         return {}
 
     def _sizing_equity(self) -> tuple[float, float]:
-        # Upstox v2 has no simple 'available funds' REST endpoint we rely on;
-        # sizing uses REAL_CAPITAL (env STMR_REDUCED_CAPITAL? no: STMR_REAL_CAPITAL).
-        return config.REAL_CAPITAL, config.REAL_CAPITAL
+        return self.account_state(today_str())
+
+    def account_state(self, date: str) -> tuple[float, float]:
+        """Real-mode account view (cash proxy, equity proxy).
+
+        Upstox v2 has no simple 'available funds' REST endpoint, so this is
+        computed from what we know for certain: the sizing base
+        (STMR_REAL_CAPITAL) + today's realized P&L (net of all fees, from the
+        trades table) - cost basis of open positions (cash proxy), marked to
+        the latest quote (equity proxy). Same basis the desk kill-switch
+        needs. Returns (cash, equity).
+        """
+        cap = config.REAL_CAPITAL
+        realized = db.closed_pnl_on(self.conn, date)
+        basis = 0.0
+        mv = 0.0
+        for p in db.get_open_positions(self.conn):
+            q = p["qty_remaining"] if p["qty_remaining"] is not None else p["qty"]
+            basis += p["entry_fill"] * q
+            px = p["entry_fill"]
+            key = self.keys.get(p["symbol"])
+            if key:
+                try:
+                    q_ = self.client.get_quote(key)
+                    if q_ and q_.get("last_price"):
+                        px = float(q_["last_price"])
+                except Exception:
+                    pass  # stale mark is safe (falls back to cost)
+            mv += px * q
+        cash = cap + realized - basis
+        equity = cap + realized + (mv - basis)
+        return cash, equity
 
     def buy(self, symbol, price, qty, t, stop, target, atr_v, detail) -> int | None:
         key = self.keys.get(symbol)
@@ -215,3 +249,42 @@ class UpstoxBroker:
         self.conn.commit()
         return ((p["realized_pnl"] or 0.0) + (fill - p["entry_fill"]) * qty
                 - fees["total"] - (p["entry_fees"] or 0.0))
+
+    def sync_stop(self, pid: int, new_stop: float) -> None:
+        """Keep the broker-side protective SL-M in step with the DB stop.
+
+        Called after every stop ratchet (trailing) and after a partial
+        (stop -> breakeven, qty reduced). Ratchets UP only - we never relax
+        the broker-side stop. Best-effort: a failure here degrades to the
+        original protective stop (still valid, just looser) and is logged.
+        """
+        p = db.get_position(self.conn, pid)
+        if not p or p["exit_time"]:
+            return
+        key = self.keys.get(p["symbol"])
+        if not key:
+            return
+        try:
+            if p["sl_order"]:
+                self.client.cancel_order(p["sl_order"])
+        except Exception:
+            pass
+        left = p["qty_remaining"] if p["qty_remaining"] is not None else p["qty"]
+        if left <= 0:
+            db.update_position(self.conn, pid, sl_order=None)
+            self.conn.commit()
+            return
+        old_stop = p["stop"]
+        if new_stop < old_stop - 1e-9:
+            # never relax the protective stop
+            new_stop = old_stop
+        try:
+            sl_oid = self.client.place_order(key, left, "SELL",
+                                             order_type="SL-M",
+                                             trigger_price=new_stop)
+            db.update_position(self.conn, pid, sl_order=sl_oid)
+            self.conn.commit()
+        except Exception as e:
+            db.log_event(self.conn, "WARN",
+                         f"SL sync failed for {p['symbol']} (stop {new_stop:.2f}): "
+                         f"{e} - protective stop stays at previous level")

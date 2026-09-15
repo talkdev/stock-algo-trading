@@ -350,6 +350,13 @@ class UpstoxClient:
         j = self._get("/user/positions")
         return j.get("data") or []
 
+    def list_orders(self, status: str | None = None) -> list:
+        """Fetch orders (optional status filter, e.g. 'OPEN') - used for the
+        startup reconciliation audit in real mode."""
+        params = {"status": status} if status else None
+        j = self._get("/orders", params=params, fm=False)
+        return j.get("data") or []
+
     # -------------------------------------------------- instrument master
     def fetch_instrument_master(self, cache_file: str | Path | None = None) -> dict:
         """

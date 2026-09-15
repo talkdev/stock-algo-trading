@@ -10,6 +10,10 @@ Validates (no network needed):
   * no partial daily bar before 15:35 (DB stays clean)
   * RESTART SAFETY: a second engine instance on the same DB resumes without
     double-trading and with open positions restored
+  * REAL MODE (mock orders): stale overnight position flattened at open,
+    protective SL-M per entry, SL follows partials (breakeven ratchet),
+    every SL cancelled at final close, no orphaned orders, real equity
+    proxy drives the equity curve
 """
 import os, sys, tempfile
 from collections import Counter
@@ -64,6 +68,10 @@ DAILY = {s: [db.Bar(r["date"] + " 00:00:00", r["open"], r["high"], r["low"],
          for s in SYMS}
 
 
+ORDERS: list = []
+_oid = [1000]
+
+
 class MockClient:
     def ensure_token(self):
         pass
@@ -71,6 +79,41 @@ class MockClient:
     def fetch_instrument_master(self, cache_file=None):
         return {s: {"instrument_key": f"NSE_EQ|{s}", "lot_size": 1, "isin": ""}
                 for s in SYMS}
+
+    # ---- order machinery (real-mode simulation) ----
+    def place_order(self, key, qty, side, product="INTRADAY",
+                    order_type="MARKET", price=0.0, trigger_price=0.0,
+                    validity="DAY"):
+        _oid[0] += 1
+        oid = f"MOCK-{_oid[0]}"
+        o = {"order_id": oid, "key": key, "side": side, "quantity": int(qty),
+             "order_type": order_type, "trigger_price": trigger_price,
+             "status": "COMPLETE", "average_trade_price": None}
+        if order_type == "MARKET":
+            q = self.get_quote(key)
+            base = q["last_price"] if q else 0.0
+            s = config.SLIPPAGE_BPS / 1e4
+            o["average_trade_price"] = round(
+                base * (1 + s) if side == "BUY" else base * (1 - s), 2)
+        else:  # SL-M etc. rest at the broker until triggered/cancelled
+            o["status"] = "OPEN"
+        ORDERS.append(o)
+        return oid
+
+    def wait_fill(self, oid, timeout=15.0):
+        return next((o for o in ORDERS if o["order_id"] == oid), {})
+
+    def cancel_order(self, oid):
+        for o in ORDERS:
+            if o["order_id"] == oid and o["status"] == "OPEN":
+                o["status"] = "CANCELED"
+        return {}
+
+    def get_order(self, oid):
+        return next((o for o in ORDERS if o["order_id"] == oid), {})
+
+    def list_orders(self, status=None):
+        return [o for o in ORDERS if not status or o["status"] == status]
 
     def get_candles(self, key, interval, start, end):
         s = key.split("|")[1]
@@ -174,8 +217,11 @@ cnt = Counter((r["symbol"], r["bar_time"], r["kind"])
 assert all(v == 1 for v in cnt.values()), \
     f"a bar was processed twice! { [k for k, v in cnt.items() if v > 1][:5] }"
 # the injected position must have survived the restart: either still open
-# with the same id, or closed BY THE POST-RESTART ENGINE at/after 14:10
-# (a legitimate exit) - never silently lost
+# with the same id, or closed BY THE POST-RESTART ENGINE - never silently
+# lost. Earliest legitimate post-restart exit: the 14:05 bar is the oldest
+# stored-but-unprocessed completed bar (the first engine stopped at 14:08,
+# after the 14:00 bar), so any exit at/after the 14:05 bar was decided by
+# the restarted engine replaying it.
 if SYMS[0] in open_A:
     pA = open_A[SYMS[0]]
     if pA["entry_time"] == f"{TODAY} 13:55:00":
@@ -185,7 +231,7 @@ if SYMS[0] in open_A:
             assert p["symbol"] == SYMS[0]
             print(f"  position {SYMS[0]} id={pA['id']} still open after restart  OK")
         else:
-            assert p["exit_time"] >= f"{TODAY} 14:10:00", \
+            assert p["exit_time"] >= f"{TODAY} 14:05:00", \
                 f"position closed before restart window: {p['exit_time']}"
             print(f"  position {SYMS[0]} id={pA['id']} restored, then exited "
                   f"by the restarted engine at {p['exit_time']} ({p['exit_reason']})  OK")
@@ -221,4 +267,91 @@ for t in closed:
     assert t["exit_reason"] in ("STOP", "TARGET", "TARGET2", "MEAN", "EOD",
                                 "DATA_END", "TIME")
     assert t["qty_remaining"] == 0, f"closed trade {t['id']} not fully settled"
-print("\nSIMULATION GREEN - restart-safe, flat at EOD, clean DB, EOD report written.")
+
+# ---------------------------------------------------------------- phase E
+print("\n== phase E: REAL mode (order/stop consistency, stale close, proxy) ==")
+DB2 = os.path.join(td, "real.db")
+conn2 = db.get_conn(DB2)
+db.init_db(conn2)
+demo_data.seed_demo(conn2, days=10, symbols=SYMS, seed=11, end_date=TODAY,
+                    quiet=True)
+for s in SYMS:
+    db.save_instrument(conn2, s, f"NSE_EQ|{s}", 1, "", "test")
+conn2.commit()
+
+# fixture: a position that survived from the previous session (crash), with
+# its broker-side SL still resting open
+yday = (datetime.strptime(TODAY, "%Y-%m-%d") - timedelta(days=1)).strftime(
+    "%Y-%m-%d")
+stale_pid = db.open_position(conn2, "TCS", "real", 20, 100.0,
+                             yday + " 14:35:00", 99.0, 101.0, 0.5, 8.0,
+                             "stale fixture", "MOCK-STALE-BUY")
+ORDERS.append({"order_id": "MOCK-STALE-SL", "key": "NSE_EQ|TCS", "side": "SELL",
+               "quantity": 20, "order_type": "SL-M", "trigger_price": 99.0,
+               "status": "OPEN", "average_trade_price": None})
+db.update_position(conn2, stale_pid, sl_order="MOCK-STALE-SL")
+conn2.commit()
+
+eng3 = Engine("real", db_path=DB2)
+assert eng3.broker is None, "real mode must not paper before API auth"
+set_now("09:16")
+eng3.pass_once()   # OPEN: stale close + order reconciliation, then sync
+
+stale = db.get_position(conn2, stale_pid)
+assert stale["exit_reason"] == "STALE_RESTART" and stale["qty_remaining"] == 0, \
+    "stale REAL position must be flattened at market open (intraday mandate)"
+assert next(o for o in ORDERS if o["order_id"] == "MOCK-STALE-SL")["status"] \
+    == "CANCELED", "stale SL order must be cancelled"
+stale_sells = [o for o in ORDERS if o["key"] == "NSE_EQ|TCS"
+               and o["order_type"] == "MARKET" and o["side"] == "SELL"
+               and o["status"] == "COMPLETE"]
+assert stale_sells, "stale close must place a real market SELL"
+assert conn2.execute(
+    "SELECT COUNT(*) FROM run_events WHERE level='ERROR' "
+    "AND msg LIKE 'STALE real position%'").fetchone()[0] >= 1, \
+    "stale real close must be logged as ERROR"
+
+run_from_to(eng3, "09:20", "15:29")
+set_now("15:38")
+eng3.pass_once()
+eng3.pass_once()
+
+trades_r = db.trades_in_range(conn2, TODAY, TODAY)
+closed_r = [t for t in trades_r if t["exit_time"]]
+assert len(trades_r) > 0, "real-mode engine should have traded the demo dips"
+assert all(t["source"] == "real" for t in trades_r)
+assert all(t["qty_remaining"] == 0 for t in closed_r)
+assert db.get_open_positions(conn2) == [], "real mode must be flat at EOD"
+
+slm = [o for o in ORDERS if o["order_type"] == "SL-M"
+       and o["order_id"] != "MOCK-STALE-SL"]
+n_entries = len(trades_r)
+assert len(slm) >= n_entries, \
+    f"every entry needs a protective SL-M (entries {n_entries}, SL-Ms {len(slm)})"
+assert not [o for o in ORDERS if o["status"] == "OPEN"], \
+    "no order (entry or SL) may be left open at the end of the day"
+for t in closed_r:
+    key = f"NSE_EQ|{t['symbol']}"
+    assert [o for o in slm if o["key"] == key], \
+        f"no protective SL-M ever for {t['symbol']} (trade {t['id']})"
+    if t["partial_count"]:
+        assert [o for o in slm if o["key"] == key
+                and o["trigger_price"] >= t["entry_fill"] - 1e-9], \
+            f"partial on {t['symbol']} must ratchet the SL to breakeven"
+
+eq_rows = conn2.execute(
+    "SELECT equity, cash FROM equity_curve WHERE note='OPEN'").fetchall()
+assert eq_rows, "real mode must write the (proxy) equity curve"
+assert all(r["equity"] > 0 for r in eq_rows)
+
+n_orders_before = len(ORDERS)
+eng4 = Engine("real", db_path=DB2)
+set_now("17:00")
+eng4.pass_once()   # CLOSED: no writes, no orders
+assert len(ORDERS) == n_orders_before, "CLOSED session must place no orders"
+assert db.get_open_positions(conn2) == []
+
+print(f"  real trades       : {len(trades_r)} (closed {len(closed_r)}) | "
+      f"SL-M orders: {len(slm)} | all cancelled: OK")
+print("\nSIMULATION GREEN - paper + real, restart-safe, flat at EOD, "
+      "order/stop-consistent, clean DB.")

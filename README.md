@@ -50,8 +50,8 @@ tunable** (see `config.py` and §7 Tuning).
 | `tune.py` | **Walk-forward parameter optimizer v2** (anchored folds, selectable objective, constraints, local refinement, overfit z-score, desk memo) → `data/best_params.json` |
 | `data_import.py` | Import REAL 5-min/daily OHLCV CSV exports (Upstox can't serve past intraday bars) |
 | `demo_data.py` | Deterministic synthetic data (tagged `source='demo'`) for offline validation |
-| `test_engine_sim.py` | Full live-engine simulation on a mock API: whole session + **restart safety** |
-| `verify_all.py` | Offline self-check (17 tests incl. partial accounting, desk guards, tuner folds and the full-session simulation) - `python verify_all.py` |
+| `test_engine_sim.py` | Full live-engine simulation on a mock API: whole session + **restart safety** + **real-mode order/stop consistency** (stale overnight close, protective SL-M lifecycle, equity proxy) |
+| `verify_all.py` | Offline self-check (18 tests incl. partial accounting, desk guards, tuner folds, engine partial-exit/SL ratchet and the paper+real simulation) - `python verify_all.py` |
 | `patch.py` | DB maintenance: status / integrity / migrate / purge-demo / reset |
 | `config.py` | Every tunable (strategy, risk, fees, session times, API) |
 | `stock_universe.json` | The 90 Nifty-100 symbols |
@@ -209,13 +209,14 @@ reason when it blocks an entry (`GUARD ...` lines, `signals` audit trail).
 ### Offline validation (no API, no network)
 
 ```bat
-python verify_all.py          REM 17 tests: indicators, fees, DB, strategy,
+python verify_all.py          REM 18 tests: indicators, fees, DB, strategy,
                               REM broker, partial accounting, time, pipeline,
                               REM precompute==raw, time-stop, tuner smoke,
-                              REM desk guards, tuner folds, objectives,
+                              REM desk guards, engine partial-exit + real
+                              REM broker SL ratchet, tuner folds, objectives,
                               REM CSV import, full-session engine simulation
-                              REM w/ restart test
-python test_engine_sim.py     REM just the full-session simulation w/ restart test
+                              REM (paper + real) w/ restart test
+python test_engine_sim.py     REM just the full-session simulation (paper + real)
 ```
 
 ### Maintenance
@@ -268,7 +269,7 @@ The full list with reasoning is in the header of `upstox_client.py`. Summary:
 |---|---|---|
 | 1 | **No intraday history before today** (5m bars = current day only) | Every completed bar is persisted to SQLite as it happens; multi-day backtests replay accumulated data (or `--seed-demo` synthetic data). No history → backtest skips with a message, never fabricates |
 | 2 | **No streaming over REST** (live data needs WebSocket) | REST polling: quotes for positions + dip watchlist every 8 s; full bars at each boundary. Exit latency bounded by poll cadence |
-| 3 | **No GTT / bracket orders** in the public API | Engine manages stops/targets/trailing (poll + market exit); real mode adds a protective SL-M for the initial stop (broker-side, expires EOD) |
+| 3 | **No GTT / bracket orders** in the public API | Engine manages stops/targets/trailing (poll + market exit). REAL mode places a broker-side protective **SL-M** per position; it is kept in sync by the engine - **replaced after every partial** (breakeven, reduced qty) and **ratcheted up on trailing** (never relaxed). A crash therefore leaves a valid broker-side stop for the day. At market open the engine also **reconciles open orders** and loudly flags any it doesn't own (no auto-cancel - another strategy may share the account) |
 | 4 | **OAuth needs TOTP at first login** | Semi-manual one-time login; tokens cached & refreshed silently; if both expire, live data is **skipped** for the day with a message (no trading on stale data) |
 | 5 | **No symbol → instrument_key lookup** | Keys from NSE instrument master CSV (cached 7 days), fallback `data/instrument_keys.json`; missing symbols are **skipped** and logged |
 | 6 | Rate limits | Calls throttled to 1 per 0.25 s with backoff on 429/5xx |
@@ -285,7 +286,54 @@ STT 0.025% both sides · NSE txn 0.019% · SEBI 0.0001% · flat brokerage ₹20
 (capped 0.03%) · GST 18% on (brokerage+exchange+SEBI) · stamp 0.015% on buys ·
 5 bps slippage/side. Good for validating the strategy - not for tax returns.
 
-## 9. Disclaimer
+## 9. Production readiness - what is hardened, and what remains
+
+**Hardened in this codebase (and tested offline, no network needed):**
+* **Crash/restart safety** - all state in SQLite (WAL); processed-bar guard;
+  stored-but-unprocessed bars are replayed on the next pass (a crash between
+  storing a bar and evaluating it loses nothing); every engine pass ends
+  with a committed connection (no dangling write transactions).
+* **Real-mode integrity** - real mode actually routes orders through
+  `UpstoxBroker` (it can no longer silently paper-trade); stale overnight
+  positions in real mode are **flattened at market open** with an ERROR
+  event (the intraday-only mandate is absolute); protective **SL-M orders
+  follow partials and trailing** (breakeven ratchet, reduced qty, never
+  relaxed) so a crash still leaves a valid broker-side stop; startup
+  **order reconciliation** flags any broker-side open order this system
+  doesn't own (logged, never auto-cancelled).
+* **Real-mode P&L basis** - equity/cash for sizing and the **daily-loss
+  kill-switch** use a real proxy (sizing base + realized P&L net of fees
+  - open position cost basis, marked to last quote), not a constant.
+* **No look-ahead, ever** - stored bars beyond the current boundary are
+  excluded from every decision path (defensive against pre-seeded/stale DBs).
+* **Full offline validation** - `verify_all.py` (18 tests) and
+  `test_engine_sim.py` run a complete simulated session in **both paper and
+  real mode** on a mock Upstox API, including restart, EOD flatten and the
+  real-mode order/stop lifecycle.
+
+**Inherent API-level limits (cannot be fixed in code - plan around them):**
+* **Polling latency** - no WebSocket over REST: stop/target reactions are
+  bounded by `POLL_FAST_SEC` (8 s). The broker-side SL-M is your backstop.
+* **No funds endpoint** - real cash/equity is a proxy (documented above);
+  keep `STMR_REAL_CAPITAL` at or below what you actually want at risk.
+* **Semi-manual OAuth** - first login needs your TOTP; if both tokens lapse
+  the engine skips live data for the day (no trading on stale data).
+* **Crash mid-order** - if the process dies between order placement and the
+  DB write, the startup reconciliation will flag the orphan; a human
+  resolves it (deliberate - never auto-cancel).
+
+**Ops checklist before running it seriously:**
+1. NTP-synced clock (session logic is wall-clock IST).
+2. Run under a process supervisor (systemd unit, or cron with `--once`
+   every minute 09:10-15:30 IST); `--status` for a read-only health check.
+3. Watch `run_events` (ERROR rows) and the daily EOD report; the desk
+   guards print `GUARD`/`DESK` lines when they act.
+4. Run in **paper mode for 1-2 weeks of real bars** and use `--compare`
+   to verify live-vs-replay agreement before real mode.
+5. Start real mode with a small `STMR_REAL_CAPITAL` and raise it only as
+   the paper track record justifies.
+
+## 10. Disclaimer
 
 This is software for research and paper trading. Intraday mean reversion loses
 money on strong trend days; the backtest numbers on demo data validate the

@@ -327,7 +327,8 @@ def update_position(conn, pid: int, **fields) -> None:
             sets.append(f"{k}=?")
             args.append(v)
     if sets:
-        conn.execute(f"UPDATE trades SET {', '.join(sets)} WHERE id=?", *args, pid)
+        conn.execute(f"UPDATE trades SET {', '.join(sets)} WHERE id=?",
+                     tuple(args) + (pid,))
 
 
 def sell_partial(conn, pid: int, qty: int, exit_fill, t, reason, exit_fees, detail) -> float:

@@ -80,7 +80,10 @@ class Engine:
         self.params = config.load_params()
         self.cfg = config.make_cfg(self.params)
         self.strat = Strategy(self.cfg)
-        self.broker = PaperBroker(self.conn)
+        # real mode: the UpstoxBroker is created in _ensure_api() (it needs
+        # the authenticated client); until then self.broker is None and every
+        # order path refuses to run (never silently papers a real mandate)
+        self.broker = PaperBroker(self.conn) if mode == "paper" else None
         self.client = None
         self.keys: dict = {}
         self.missing: list = []
@@ -96,6 +99,8 @@ class Engine:
         self._api_warned = False
         self._holiday_logged = False
         self._halted = False
+        self._stale_checked = False
+        self._reconciled = False
 
     # ------------------------------------------------------------------ boot
     def _restore_state(self) -> None:
@@ -114,13 +119,22 @@ class Engine:
 
         for p in db.get_open_positions(self.conn):
             if not p["entry_time"].startswith(today):
+                if self.mode == "real":
+                    # cannot place orders without the API - flattened at the
+                    # first OPEN pass with market access (intraday mandate)
+                    db.log_event(self.conn, "ERROR",
+                                 f"STALE real-mode position {p['symbol']} "
+                                 f"id={p['id']} from {p['entry_time'][:10]} - "
+                                 "will be flattened at market open")
+                    print(f"[ERROR] stale REAL position {p['symbol']} from a "
+                          "previous day - will be flattened at market open")
+                    continue
                 lp = (self.broker.last_prices([p["symbol"]]).get(p["symbol"])
                       or p["entry_fill"])
-                pnl = (self.broker.sell(p["id"], lp, now_str(), "STALE_RESTART",
-                                        "position survived a restart across days; "
-                                        "closed at last stored price (paper mode "
-                                        "keeps the intraday-only mandate)")
-                       if self.mode == "paper" else None)
+                pnl = self.broker.sell(p["id"], lp, now_str(), "STALE_RESTART",
+                                       "position survived a restart across days; "
+                                       "closed at last stored price (paper mode "
+                                       "keeps the intraday-only mandate)")
                 db.log_event(self.conn, "WARN",
                              f"stale position {p['symbol']} id={p['id']} closed "
                              f"at {lp:.2f} pnl={pnl if pnl is not None else 'n/a'}")
@@ -130,10 +144,21 @@ class Engine:
     def _print_banner(self) -> None:
         now = ist_now()
         mode_txt = ("PAPER (simulated fills, Upstox market data)"
-                    if self.mode == "paper" else "REAL (Upstox live orders)")
-        lp = self.broker.last_prices(self.universe)
-        cash, equity = self.broker.equity(lp)
+                    if self.mode == "paper" else
+                    "REAL (Upstox live orders + broker-side protective SL-M "
+                    "per position)")
         pos = db.get_open_positions(self.conn)
+        if self.mode == "paper":
+            lp = self.broker.last_prices(self.universe)
+            cash, equity = self.broker.equity(lp)
+            port_txt = f"INR {inr(equity)}  |  open positions: {len(pos)}"
+        elif self.broker is not None:
+            cash, equity = self.broker.account_state(today_str(now))
+            port_txt = (f"INR {inr(equity)} (real proxy)  |  "
+                        f"open positions: {len(pos)}")
+        else:
+            port_txt = (f"n/a until API auth (see 'Upstox setup')  |  "
+                        f"open positions: {len(pos)}")
         banner(
             f"STMR v{config.VERSION} - SHORT-TERM MEAN REVERSION ENGINE",
             [
@@ -144,7 +169,7 @@ class Engine:
                 f"parameters   : "
                 + (f"TUNED ({len(self.params)} overrides from {config.PARAMS_FILE.name})"
                    if self.params else "defaults (config.py)"),
-                f"portfolio    : INR {inr(equity)}  |  open positions: {len(pos)}",
+                f"portfolio    : {port_txt}",
                 f"strategy     : dip z<={-self.cfg.DIP_Z} (lookback {self.cfg.DIP_LOOKBACK}b)"
                                 f" + green reclaim | target=SMA{self.cfg.SMOOTH_N} | "
                                 f"stop={self.cfg.SL_ATR_MULT}xATR | "
@@ -188,6 +213,18 @@ class Engine:
             self.conn.commit()
 
     def pass_once(self) -> None:
+        """One engine pass. ALWAYS leaves the connection committed - a
+        dangling write transaction on a long-lived connection would starve
+        the WAL (and block any second process reading the same DB)."""
+        try:
+            self._pass_once_impl()
+        finally:
+            try:
+                self.conn.commit()
+            except Exception:
+                pass
+
+    def _pass_once_impl(self) -> None:
         now = ist_now()
         date = today_str(now)
         if date != self.day:
@@ -196,6 +233,8 @@ class Engine:
             self._finalized = False
             self.watch = set()
             self._holiday_logged = False
+            self._stale_checked = False
+            self._reconciled = False
             self._restore_state()
 
         phase = session_phase(now)
@@ -234,6 +273,8 @@ class Engine:
         # ---------------- OPEN ----------------
         if not self._ensure_api():
             return
+        self._close_stale_real_positions(now)
+        self._reconcile_open_orders()
         if not self._day_synced:
             self._sync_day(date, now)
             self._day_synced = True
@@ -261,10 +302,14 @@ class Engine:
                 from upstox_client import UpstoxClient
                 self.client = UpstoxClient()
                 self.client.ensure_token()
+            if self.mode == "real" and self.broker is None:
+                self.broker = UpstoxBroker(self.conn, self.client)
             mapping, missing = data_fetch.ensure_instruments(self.client, self.conn,
                                                              self.universe)
             self.keys = mapping
             self.missing = missing
+            if self.broker is not None and self.mode == "real":
+                self.broker.set_keys(mapping)
             if not mapping:
                 self._warn_once(
                     "NO instrument keys available - cannot trade or capture data. "
@@ -307,6 +352,75 @@ class Engine:
         self._say(f"initial sync done: {n_ok} symbols, {n_bars} bars captured, "
                   f"{n_live} live ({n_fail} failed)")
 
+    # ------------------------------------------------ real-mode safety (open)
+    def _close_stale_real_positions(self, now: datetime) -> None:
+        """Flatten positions that survived from a previous day (real mode).
+
+        A Friday-crash leftover MUST not be held overnight - the intraday
+        mandate is absolute. Runs once per day, at the first OPEN pass with
+        market access (needs quotes + orders).
+        """
+        if self.mode != "real" or self._stale_checked:
+            return
+        self._stale_checked = True
+        today = today_str(now)
+        for p in db.get_open_positions(self.conn):
+            if p["entry_time"].startswith(today):
+                continue
+            px = None
+            key = self.keys.get(p["symbol"])
+            if key:
+                try:
+                    q = self.client.get_quote(key)
+                    if q:
+                        px = q["last_price"]
+                except UpstoxError:
+                    pass
+            px = px or p["entry_fill"]
+            call = ExitCall("STALE_RESTART", px,
+                            "position survived from a previous day; real mode "
+                            "flattens it immediately (intraday-only mandate)")
+            pnl = self._real_sell(p, call, fmt_t(now), "STALE_RESTART")
+            db.log_event(self.conn, "ERROR",
+                         f"STALE real position {p['symbol']} id={p['id']} "
+                         f"(from {p['entry_time'][:10]}) closed at {px:.2f} "
+                         f"pnl={pnl if pnl is not None else 'n/a'} - "
+                         "investigate why it survived")
+            print(f"[ERROR] STALE real-mode position {p['symbol']} closed at "
+                  f"{px:.2f} (pnl {pnl if pnl is not None else 'n/a'}) - "
+                  "investigate")
+
+    def _reconcile_open_orders(self) -> None:
+        """Startup audit (real mode): flag any broker-side open order this
+        system doesn't know about (e.g. orphaned by a crash mid-order).
+
+        Deliberately does NOT auto-cancel - an unknown open order may belong
+        to another strategy on the same account; a human decides.
+        """
+        if self.mode != "real" or self._reconciled:
+            return
+        self._reconciled = True
+        try:
+            orders = self.client.list_orders(status="OPEN")
+        except UpstoxError as e:
+            db.log_event(self.conn, "WARN",
+                         f"open-order reconciliation skipped: {e}")
+            return
+        known = {p["sl_order"] for p in db.get_open_positions(self.conn)
+                 if p["sl_order"]}
+        for o in orders:
+            oid = o.get("order_id")
+            if oid and oid not in known:
+                msg = (f"untracked OPEN order at startup: {oid} "
+                       f"({o.get('instrument_key')} {o.get('transaction_type')} "
+                       f"qty {o.get('quantity')} {o.get('order_type')}) - "
+                       "review your account")
+                db.log_event(self.conn, "WARN", msg)
+                print(f"[WARN] {msg}")
+        if not orders:
+            self._say("order reconciliation: no open orders at the broker "
+                      "(clean start)", once_per=0)
+
     # ----------------------------------------------------------------- scan
     def _scan_pass(self, date: str, completed: datetime, now: datetime) -> None:
         """Fetch the newly completed 5-min bar for every symbol and evaluate."""
@@ -321,26 +435,35 @@ class Engine:
             key = self.keys.get(s)
             if not key:
                 continue
-            if self.last_completed.get(s) and self.last_completed[s] >= completed_str:
-                continue
-            try:
-                n_new_bars, _ = data_fetch.sync_day_bars(self.client, self.conn,
-                                                         s, key, date, now)
-                n_new += n_new_bars
-            except UpstoxError:
-                n_fail += 1
-                continue
-            self.last_completed[s] = db.last_bar_time(self.conn, s, date) \
-                or self.last_completed.get(s, "")
+            # Skip only the FETCH when we already have bars up to the
+            # boundary - never skip evaluation: a crash between storing a
+            # bar and evaluating it must not lose that bar (the
+            # processed_bars guard makes re-evaluation safe).
+            if not (self.last_completed.get(s)
+                    and self.last_completed[s] >= completed_str):
+                try:
+                    n_new_bars, _ = data_fetch.sync_day_bars(self.client,
+                                                             self.conn, s, key,
+                                                             date, now)
+                    n_new += n_new_bars
+                except UpstoxError:
+                    n_fail += 1
+                self.last_completed[s] = db.last_bar_time(self.conn, s, date) \
+                    or self.last_completed.get(s, "")
             bars = db.get_day_bars(self.conn, s, date)
             for b in bars:
+                if b.t > completed_str:      # no look-ahead at any cost
+                    break
                 if db.mark_processed(self.conn, s, b.t, "scan"):
                     self._evaluate_bar(s, date, b.t, now, dips, entries, exits,
                                        z_bottoms)
 
         if entries or exits or dips or (n_new and not self.quiet):
-            lp = self.broker.last_prices(self.universe)
-            cash, equity = self.broker.equity(lp)
+            if self.mode == "paper":
+                lp = self.broker.last_prices(self.universe)
+                cash, equity = self.broker.equity(lp)
+            else:
+                cash, equity = self.broker.account_state(date)
             n_open = len(db.get_open_positions(self.conn))
             self._say(f"SCAN bar {completed_str[11:16]} done | "
                       f"{len(self.keys)} symbols | new bars: {n_new} "
@@ -357,6 +480,11 @@ class Engine:
     def _evaluate_bar(self, sym: str, date: str, bar_t: str, now: datetime,
                       dips: list, entries: list, exits: list, z_bottoms: list) -> None:
         bars = db.get_day_bars(self.conn, sym, date)
+        # Defensive: never look at bars AFTER the one being evaluated
+        # (normal operation stores only completed bars, but a pre-seeded or
+        # stale DB must not leak future prices into the decision).
+        if bars and bars[-1].t > bar_t:
+            bars = [b for b in bars if b.t <= bar_t]
         if not bars or bars[-1].t != bar_t:
             return
         pre = self.strat.precompute(bars)
@@ -377,19 +505,15 @@ class Engine:
             call, new_stop = self.strat.evaluate_exit(p, bars, tick=None, now=now,
                                                       pre=pre, bars_held=bars_held)
             if call:
-                pnl, reason, partial = self._execute_exit(p, call, bar_t)
+                pnl, reason, partial = self._execute_exit(p, call, bar_t, m=m)
                 if partial:
-                    db.record_signal(self.conn, now_str(), sym, bar_t, "PARTIAL",
-                                     call.price, m["z"], m["rsi"], m["atr"],
-                                     call.note, "live")
+                    pass  # audit-logged inside _execute_exit (PARTIAL signal)
                 else:
                     exits.append(sym)
-                    db.record_signal(self.conn, now_str(), sym, bar_t, "EXIT",
-                                     call.price, m["z"], m["rsi"], m["atr"],
-                                     f"{reason}: {call.note}", "live")
                     self._say_exit(sym, p, call, pnl, bar_t, reason)
             elif new_stop > p["stop"] + 1e-9:
                 db.update_position(self.conn, p["id"], stop=new_stop)
+                self.broker.sync_stop(p["id"], new_stop)  # real: ratchet SL-M
                 db.record_signal(self.conn, now_str(), sym, bar_t, "TRAIL",
                                  bars[-1].c, m["z"], m["rsi"], m["atr"],
                                  f"stop {p['stop']:.2f} -> {new_stop:.2f} "
@@ -408,8 +532,8 @@ class Engine:
                 _, equity = self.broker.equity(self.broker.last_prices([sym]))
                 cash = self.broker.cash()
             else:
-                _, equity = self.broker.equity({})
-                cash = config.REAL_CAPITAL
+                # real: sizing base + realized P&L - open position cost basis
+                cash, equity = self.broker.account_state(date)
             plan, sigs, skip = self.strat.evaluate_entry(
                 sym, ctx, bars, now_hm=now_hm, equity=equity, cash=cash, pre=pre)
             for kind, detail in sigs:
@@ -451,8 +575,20 @@ class Engine:
             entries.append(plan.symbol)
             self._say_entry(plan)
 
-    def _execute_exit(self, p, call: ExitCall, t: str):
+    def _log_exit_signal(self, sym: str, t: str, kind: str, price: float,
+                         m: dict | None, note: str, tick: bool = False) -> None:
+        z = m["z"] if m else None
+        rsi_v = m["rsi"] if m else None
+        atr_v = m["atr"] if m else None
+        if tick:
+            note = f"{note} (tick)"
+        db.record_signal(self.conn, now_str(), sym, t, kind, price, z, rsi_v,
+                         atr_v, note, "live")
+
+    def _execute_exit(self, p, call: ExitCall, t: str, m: dict | None = None,
+                      tick: bool = False):
         """Execute an exit call with desk partial-profit rules.
+        Owns the PARTIAL/EXIT audit log so every exit path is recorded.
         Returns (total_pnl | None, reason, partial_happened)."""
         if call.reason == "TARGET":
             act = self.strat.plan_target_exit(p)
@@ -468,6 +604,10 @@ class Engine:
                 if slice_pnl is not None:
                     db.update_position(self.conn, p["id"], stop=act["new_stop"],
                                        target=act["target2"])
+                    self.broker.sync_stop(p["id"], act["new_stop"])
+                    self._log_exit_signal(p["symbol"], t, "PARTIAL", call.price,
+                                          m, act["note"], tick)
+                    self.conn.commit()
                     self._say(f"  PART   {p['symbol']:<11} {act['note']} | "
                               f"slice pnl {signed(slice_pnl)}", level="ok")
                     return None, "PARTIAL", True
@@ -481,6 +621,9 @@ class Engine:
             db.log_event(self.conn, "ERROR", f"sell {p['symbol']}: {e!r}")
             print(f"[ERROR] sell failed for {p['symbol']}: {e}")
             pnl = None
+        self._log_exit_signal(p["symbol"], t, "EXIT", call.price, m,
+                              f"{reason}: {call.note}", tick)
+        self.conn.commit()
         return pnl, reason, False
 
     def _real_sell(self, p, call: ExitCall, t: str, reason: str | None = None):
@@ -540,19 +683,19 @@ class Engine:
                       if p["symbol"] == s), None)
             if not p:
                 continue
-            bars = db.get_day_bars(self.conn, s, date) + [live_bar]
+            stored = [b for b in db.get_day_bars(self.conn, s, date)
+                      if b.t <= live_bar.t]
+            bars = stored + [live_bar]
             call, new_stop = self.strat.evaluate_exit(p, bars,
                                                       tick=live_bar.c, now=now)
             if call:
-                pnl, reason, partial = self._execute_exit(p, call, fmt_t(now))
-                db.record_signal(self.conn, now_str(), s, live_bar.t,
-                                 "PARTIAL" if partial else "EXIT",
-                                 call.price, None, None, None,
-                                 f"{reason}: {call.note} (tick)", "live")
+                pnl, reason, partial = self._execute_exit(p, call, fmt_t(now),
+                                                          tick=True)
                 if not partial:
                     self._say_exit(s, p, call, pnl, fmt_t(now), reason)
             elif new_stop > p["stop"] + 1e-9:
                 db.update_position(self.conn, p["id"], stop=new_stop)
+                self.broker.sync_stop(p["id"], new_stop)  # real: ratchet SL-M
                 db.record_signal(self.conn, now_str(), s, live_bar.t, "TRAIL",
                                  live_bar.c, None, None, None,
                                  f"stop {p['stop']:.2f} -> {new_stop:.2f} (tick)",
@@ -596,8 +739,10 @@ class Engine:
             return
         self._say(f"post-close: persisting final bar + daily bar for {date} ...")
         data_fetch.finalize_day(self.client, self.conn, date, self.universe, self.keys)
+        self.conn.commit()
         self._finalized = True
         self._write_eod_report(date)
+        self.conn.commit()  # every pass must end with a committed connection
 
     def _write_eod_report(self, date: str) -> None:
         trades = db.trades_in_range(self.conn, date, date)
@@ -641,8 +786,12 @@ class Engine:
 
     # -------------------------------------------------------------- heartbeat
     def _heartbeat(self, date: str, now: datetime) -> None:
-        lp = self.broker.last_prices(self.universe)
-        cash, equity = self.broker.equity(lp)
+        if self.mode == "paper":
+            lp = self.broker.last_prices(self.universe)
+            cash, equity = self.broker.equity(lp)
+        else:
+            # real: proxy from sizing base + realized P&L + open marks
+            cash, equity = self.broker.account_state(date)
         realized = db.closed_pnl_on(self.conn, date)
         db.append_equity(self.conn, now_str(), cash, equity,
                          len(db.get_open_positions(self.conn)), realized, "OPEN")
@@ -650,7 +799,13 @@ class Engine:
         if self.cfg.DAILY_LOSS_LIMIT_PCT > 0 and not self._halted:
             eq_start = db.get_meta(self.conn, f"eq_start_{date}")
             if not eq_start:
-                db.set_meta(self.conn, f"eq_start_{date}", str(equity))
+                # prefer today's earliest equity point (covers a mid-day
+                # restart where a previous instance already wrote points)
+                r = self.conn.execute(
+                    "SELECT equity FROM equity_curve WHERE ts LIKE ? "
+                    "ORDER BY ts ASC LIMIT 1", (date + " %",)).fetchone()
+                eq_start = str(r["equity"]) if r else str(equity)
+                db.set_meta(self.conn, f"eq_start_{date}", eq_start)
                 self.conn.commit()
             elif equity <= float(eq_start) * (1 - self.cfg.DAILY_LOSS_LIMIT_PCT / 100):
                 self._halted = True

@@ -547,6 +547,102 @@ def test_objectives():
     assert not tune.eligible(st, 10, 3.0, min_wr=61)      # win rate under
 
 
+def test_engine_partial_exit():
+    """Engine partial-profit wiring (paper) + real-broker SL ratchet."""
+    from engine import Engine
+    from execution import UpstoxBroker
+    from strategy import ExitCall
+    with tempfile.TemporaryDirectory() as td:
+        # --- paper engine: partial at target -> breakeven -> TARGET2 runner
+        eng = Engine(mode="paper", db_path=os.path.join(td, "p.db"), quiet=True)
+        eng.strat = Strategy(config.make_cfg(
+            {"PARTIAL_PCT": 50.0, "R_MULT_TARGET2": 1.5,
+             "BE_AFTER_PARTIAL": True}))
+        pid = eng.broker.buy("X", 100.0, 100, "2026-09-14 10:00:00", 99.0,
+                             101.0, 0.5, "t")
+        assert pid
+        pnl, reason, partial = eng._execute_exit(
+            db.get_position(eng.conn, pid),
+            ExitCall("TARGET", 101.0, "hit target"), "2026-09-14 10:30:00")
+        assert partial and reason == "PARTIAL" and pnl is None
+        p = db.get_position(eng.conn, pid)
+        entry = p["entry_fill"]  # 100.0 + slippage
+        assert p["qty_remaining"] == 50 and p["partial_count"] == 1
+        assert abs(p["stop"] - entry) < 1e-9, "stop must move to breakeven"
+        assert abs(p["target"] - (entry + (entry - 99.0) * 1.5)) < 1e-9, \
+            "runner target = 1.5R from the fill"
+        assert eng.conn.execute(
+            "SELECT COUNT(*) FROM signals WHERE kind='PARTIAL'"
+        ).fetchone()[0] >= 1, "partial must be audit-logged"
+        # runner reaches target-2 -> full close reported as TARGET2
+        pnl, reason, partial = eng._execute_exit(
+            db.get_position(eng.conn, pid),
+            ExitCall("TARGET", 101.5, "runner"), "2026-09-14 11:00:00")
+        assert not partial and reason == "TARGET2" and pnl is not None
+        p = db.get_position(eng.conn, pid)
+        assert p["qty_remaining"] == 0 and p["exit_reason"] == "TARGET2"
+
+        # --- real broker: protective SL-M follows the partial (breakeven)
+        conn2 = db.get_conn(os.path.join(td, "r.db"))
+        db.init_db(conn2)
+        orders = []
+        fills = iter([100.0, 101.0, 101.5])  # buy, partial, final close
+
+        class Rec:  # order-recording fake Upstox client
+            def __init__(self):
+                self.n = 0
+
+            def place_order(self, key, qty, side, product="INTRADAY",
+                            order_type="MARKET", price=0.0, trigger_price=0.0,
+                            validity="DAY"):
+                self.n += 1
+                o = {"id": f"R{self.n}", "key": key, "qty": int(qty),
+                     "side": side, "type": order_type, "trigger": trigger_price,
+                     "status": "OPEN" if order_type == "SL-M" else "COMPLETE"}
+                orders.append(o)
+                return o["id"]
+
+            def cancel_order(self, oid):
+                for o in orders:
+                    if o["id"] == oid and o["status"] == "OPEN":
+                        o["status"] = "CANCELED"
+                return {}
+
+            def wait_fill(self, oid, timeout=15.0):
+                return {"average_trade_price": next(fills)}
+
+            def get_quote(self, key):
+                return {"last_price": 100.0}
+
+        b = UpstoxBroker(conn2, Rec())
+        b.set_keys({"X": "K|X"})
+        pid2 = b.buy("X", 100.0, 100, "2026-09-14 10:00:00", 99.0, 101.0,
+                     0.5, "t")
+        assert pid2
+        sls = [o for o in orders if o["type"] == "SL-M"]
+        assert sls and sls[-1]["status"] == "OPEN" \
+            and sls[-1]["trigger"] == 99.0 and sls[-1]["qty"] == 100, \
+            "entry must place a protective SL-M at the initial stop"
+        r = b.sell_partial(pid2, 101.0, 50, "2026-09-14 10:30:00",
+                           "PARTIAL", "50% at mean")
+        assert r is not None and r > 0
+        db.update_position(conn2, pid2, stop=100.0, target=101.5)
+        b.sync_stop(pid2, 100.0)
+        sls = [o for o in orders if o["type"] == "SL-M"]
+        assert sls[-1]["status"] == "OPEN" and sls[-1]["trigger"] == 100.0 \
+            and sls[-1]["qty"] == 50, \
+            "SL must follow the partial: breakeven trigger, reduced qty"
+        assert all(o["status"] != "OPEN" for o in sls[:-1]), \
+            "superseded SL orders must be cancelled"
+        b.sync_stop(pid2, 98.0)  # engine must never relax the protective stop
+        sls = [o for o in orders if o["type"] == "SL-M"]
+        assert sls[-1]["trigger"] == 100.0, "SL must never ratchet DOWN"
+        pnl = b.sell(pid2, 101.5, "2026-09-14 11:00:00", "TARGET2", "runner")
+        assert pnl is not None
+        assert not [o for o in orders if o["status"] == "OPEN"], \
+            "no order may be left open after the position closes"
+
+
 def test_import_csv():
     import data_import
     with tempfile.TemporaryDirectory() as td:
@@ -617,6 +713,8 @@ def main() -> int:
           test_tuner_smoke)
     check("desk guards (cutoff, event ATR, weak bar, partials, engine gates)",
           test_desk_guards)
+    check("engine partial exit + real-broker SL ratchet",
+          test_engine_partial_exit)
     check("tuner: anchored folds + multi-fold rows", test_tuner_folds)
     check("tuner: objective scalars + eligibility", test_objectives)
     check("csv import: 5m + daily, idempotent re-import", test_import_csv)
