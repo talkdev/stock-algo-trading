@@ -39,7 +39,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import config
-from indicators import Bar, atr, rsi, sma, zscores
+from indicators import Bar, atr, rsi, sma, vwap, zscores
 
 
 @dataclass
@@ -90,24 +90,42 @@ class ExitCall:
 
 class Strategy:
     def __init__(self, cfg=None):
-        self.cfg = cfg or config
+        # cfg may be the config module (defaults) or a make_cfg() namespace
+        # (tuned overrides from best_params.json / the tuner).
+        self.cfg = cfg or config.make_cfg()
 
     # ------------------------------------------------------------------ scan
-    def scan(self, bars: list[Bar]) -> dict | None:
-        """Indicators for the most recent bar. None if not enough data yet."""
+    def precompute(self, bars: list[Bar]) -> dict:
+        """Indicator series for a full bar list, computed ONCE.
+        The backtest/tuner call this per (symbol, day) and slice per bar,
+        which is ~10x faster than recomputing per bar (bit-identical values:
+        z[i]/rsi[i]/atr[i]/sma[i] depend only on bars[:i+1])."""
+        n = self.cfg
+        closes = [b.c for b in bars]
+        return {
+            "z": zscores(closes, n.SMOOTH_N),
+            "rsi": rsi(closes, n.RSI_N),
+            "atr": atr(bars, n.ATR_N),
+            "sma": sma(closes, n.SMOOTH_N),
+        }
+
+    def scan(self, bars: list[Bar], pre: dict | None = None) -> dict | None:
+        """Indicators for the most recent bar. None if not enough data yet.
+        `pre` is an optional precompute() dict aligned to `bars`."""
         n = self.cfg
         if len(bars) < n.WARMUP_BARS:
             return None
-        closes = [b.c for b in bars]
-        zs = zscores(closes, n.SMOOTH_N)
-        rsis = rsi(closes, n.RSI_N)
-        atrs = atr(bars, n.ATR_N)
+        if pre is None:
+            pre = self.precompute(bars)
+        zs, rsis, atrs = pre["z"], pre["rsi"], pre["atr"]
         if zs[-1] is None or zs[-2] is None or atrs[-1] is None:
             return None
         recent_z = zs[-n.DIP_LOOKBACK:]
         if any(z is None for z in recent_z):
             return None
         recent_rsi = [r for r in rsis[-n.DIP_LOOKBACK:] if r is not None]
+        closes = [b.c for b in bars]
+        w = closes[-n.DIP_LOOKBACK:]
         return {
             "z": zs[-1],
             "z_prev": zs[-2],
@@ -115,22 +133,24 @@ class Strategy:
             "rsi": rsis[-1],
             "min_rsi": min(recent_rsi) if recent_rsi else None,
             "atr": atrs[-1],
-            "sma": sma(closes, n.SMOOTH_N)[-1],
+            "sma": pre["sma"][-1],
+            "depth": max(w) - min(w),
         }
 
     # ----------------------------------------------------------------- entry
     def evaluate_entry(self, symbol: str, ctx: StockContext | None,
                        bars: list[Bar], now_hm: str | None = None,
                        equity: float | None = None,
-                       cash: float | None = None):
+                       cash: float | None = None,
+                       pre: dict | None = None):
         """
         Returns (plan | None, signals, skip_reason).
         `signals` is a list of (kind, detail) tuples to persist/log
-        (e.g. a fresh DIP crossing).
+        (e.g. a fresh DIP crossing). `pre` = optional precompute() dict.
         """
         n = self.cfg
         sigs: list[tuple[str, str]] = []
-        m = self.scan(bars)
+        m = self.scan(bars, pre)
         if m is None:
             return None, sigs, "warmup"
         z, z_prev = m["z"], m["z_prev"]
@@ -174,6 +194,16 @@ class Strategy:
             return None, sigs, f"RSI too hot ({m['rsi']:.1f} > {n.ENTRY_RSI_MAX})"
         if m["atr"] is None or m["atr"] <= 0:
             return None, sigs, "ATR unavailable"
+        if n.USE_VWAP_FILTER:
+            vw = vwap(bars)
+            if vw and b.c > vw * 1.001:
+                return None, sigs, f"above VWAP ({b.c:.2f} > {vw:.2f})"
+        if n.MIN_ATR_PCT > 0 and m["atr"] / b.c * 100 < n.MIN_ATR_PCT:
+            return None, sigs, (f"too quiet (ATR {m['atr'] / b.c * 100:.3f}% "
+                                f"< {n.MIN_ATR_PCT}%)")
+        if n.DIP_MIN_DEPTH_ATR > 0 and m["depth"] < n.DIP_MIN_DEPTH_ATR * m["atr"]:
+            return None, sigs, (f"dip too shallow ({m['depth']:.2f} < "
+                                f"{n.DIP_MIN_DEPTH_ATR}x ATR {m['atr']:.2f})")
 
         # ---- risk geometry ----
         stop = b.c - n.SL_ATR_MULT * m["atr"]
@@ -216,13 +246,17 @@ class Strategy:
 
     # ----------------------------------------------------------------- exit
     def evaluate_exit(self, pos: dict, bars: list[Bar], tick: float | None = None,
-                      now=None, is_last_bar: bool = False):
+                      now=None, is_last_bar: bool = False,
+                      pre: dict | None = None,
+                      bars_held: int | None = None):
         """
         Check exits for an open position.
         pos: mapping with at least 'stop' and 'target'.
         bars: day's bars up to and INCLUDING the current bar (the last one may
               be a live partial bar in the live engine).
         tick: latest price (live engine only; backtest passes None).
+        pre: optional precompute() dict aligned to `bars`.
+        bars_held: 5-min bars elapsed since entry (enables the TIME stop).
         Returns (ExitCall | None, new_stop) where new_stop may have trailed.
         """
         n = self.cfg
@@ -257,17 +291,29 @@ class Strategy:
                 fill, note = pos["target"], f"high {b.h:.2f} reached mean target {pos['target']:.2f}"
             return ExitCall("TARGET", fill, note), new_stop
 
-        # 4) bar-close mean reversion + trailing (needs full window)
+        # 4) bar-close mean reversion + trailing + time stop (needs full window)
         if len(bars) >= n.SMOOTH_N:
-            closes = [x.c for x in bars]
-            z = zscores(closes, n.SMOOTH_N)[-1]
-            s = sma(closes, n.SMOOTH_N)[-1]
+            if pre is not None:
+                z, s, a = pre["z"][-1], pre["sma"][-1], pre["atr"][-1]
+            else:
+                closes = [x.c for x in bars]
+                z = zscores(closes, n.SMOOTH_N)[-1]
+                s = sma(closes, n.SMOOTH_N)[-1]
+                a = atr(bars, n.ATR_N)[-1]
             if z is not None and z >= n.EXIT_Z:
                 return ExitCall("MEAN", b.c,
                                 f"close {b.c:.2f} back at mean (z {z:+.2f} >= "
                                 f"{n.EXIT_Z:+.2f}, SMA20 {s:.2f})"), new_stop
+            # time stop: no reversion after N bars - cut the dead money
+            # (bar-close evaluations only; never on intra-bar ticks)
+            if (tick is None and n.TIME_STOP_BARS and bars_held is not None
+                    and bars_held >= n.TIME_STOP_BARS
+                    and z is not None and z < n.EXIT_Z and b.c < pos["target"]):
+                return ExitCall("TIME", b.c,
+                                f"held {bars_held} bars without reversion "
+                                f"(z {z:+.2f} < {n.EXIT_Z:+.2f}, still below "
+                                f"mean {pos['target']:.2f})"), new_stop
             if b.c > pos["target"]:
-                a = atr(bars, n.ATR_N)[-1]
                 if a:
                     ns = max(pos["stop"], b.c - n.TRAIL_ATR_MULT * a)
                     if ns > pos["stop"] + 1e-9:

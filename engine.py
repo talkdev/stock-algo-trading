@@ -56,7 +56,9 @@ class Engine:
         db.init_db(self.conn)
 
         self.universe = config.load_universe()
-        self.strat = Strategy()
+        self.params = config.load_params()
+        self.cfg = config.make_cfg(self.params)
+        self.strat = Strategy(self.cfg)
         self.broker = PaperBroker(self.conn)
         self.client = None
         self.keys: dict = {}
@@ -111,9 +113,14 @@ class Engine:
                 f"date/time    : {fmt_t(now)} IST   session: {session_phase(now)}",
                 f"universe     : {len(self.universe)} Nifty-100 names (long-only, intraday)",
                 f"database     : {config.DB_PATH}",
+                f"parameters   : "
+                + (f"TUNED ({len(self.params)} overrides from {config.PARAMS_FILE.name})"
+                   if self.params else "defaults (config.py)"),
                 f"portfolio    : INR {inr(equity)}  |  open positions: {len(pos)}",
-                f"strategy     : dip z<={-config.DIP_Z} + green reclaim | target=SMA20 | "
-                                f"stop={config.SL_ATR_MULT}xATR | flat by {config.EOD_FLAT_AT}",
+                f"strategy     : dip z<={-self.cfg.DIP_Z} (lookback {self.cfg.DIP_LOOKBACK}b)"
+                                f" + green reclaim | target=SMA{self.cfg.SMOOTH_N} | "
+                                f"stop={self.cfg.SL_ATR_MULT}xATR | "
+                                f"flat by {self.cfg.EOD_FLAT_AT}",
             ],
         )
         if pos:
@@ -320,7 +327,8 @@ class Engine:
         bars = db.get_day_bars(self.conn, sym, date)
         if not bars or bars[-1].t != bar_t:
             return
-        m = self.strat.scan(bars)
+        pre = self.strat.precompute(bars)
+        m = self.strat.scan(bars, pre)
         if m is None:
             return
         z_bottoms.append((sym, m["min_z"]))
@@ -332,7 +340,10 @@ class Engine:
         p = next((p for p in db.get_open_positions(self.conn)
                   if p["symbol"] == sym), None)
         if p:
-            call, new_stop = self.strat.evaluate_exit(p, bars, tick=None, now=now)
+            bars_held = max(0, int((now - parse_t(p["entry_time"])).total_seconds()
+                                   // (config.BAR_MINUTES * 60)))
+            call, new_stop = self.strat.evaluate_exit(p, bars, tick=None, now=now,
+                                                      pre=pre, bars_held=bars_held)
             if call:
                 pnl = (self.broker.sell(p["id"], call.price, bar_t, call.reason,
                                         call.note)
@@ -354,7 +365,7 @@ class Engine:
 
         # ---- 2) entries (only when flat on this symbol and slot available)
         open_pos = db.get_open_positions(self.conn)
-        if p is None and len(open_pos) < config.MAX_POSITIONS:
+        if p is None and len(open_pos) < self.cfg.MAX_POSITIONS:
             now_hm = bar_t[11:16]
             if self.mode == "paper":
                 _, equity = self.broker.equity(self.broker.last_prices([sym]))
@@ -363,7 +374,7 @@ class Engine:
                 _, equity = self.broker.equity({})
                 cash = config.REAL_CAPITAL
             plan, sigs, skip = self.strat.evaluate_entry(
-                sym, ctx, bars, now_hm=now_hm, equity=equity, cash=cash)
+                sym, ctx, bars, now_hm=now_hm, equity=equity, cash=cash, pre=pre)
             for kind, detail in sigs:
                 db.record_signal(self.conn, now_str(), sym, bar_t, kind,
                                  bars[-1].c, m["z"], m["rsi"], m["atr"], detail, "live")

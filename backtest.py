@@ -44,14 +44,16 @@ from strategy import StockContext, Strategy
 # replay
 # ===========================================================================
 def run_backtest(conn, start: str, end: str, symbols: list[str],
-                 start_equity: float, quiet: bool = False) -> dict:
-    strat = Strategy()
+                 start_equity: float, quiet: bool = False,
+                 cfg=None, use_pre: bool = True) -> dict:
+    cfg = cfg or config.make_cfg(config.load_params())
+    strat = Strategy(cfg)
     days = db.distinct_dates(conn, start, end, symbols)
     if not days:
         print(f"[backtest] no 5-min data in the DB for {start}..{end} - nothing "
               f"to replay. (The Upstox API only returns today's intraday bars, "
-              f"so history must first be accumulated by running the engine, or "
-              f"use --seed-demo for synthetic data.)")
+              f"so history must first be accumulated by running the engine, "
+              f"imported via --import-csv, or use --seed-demo for synthetic.)")
         return {"days": [], "trades": [], "equity": []}
 
     if not quiet:
@@ -72,6 +74,13 @@ def run_backtest(conn, start: str, end: str, symbols: list[str],
         n_bars = max(len(b) for b in nonempty)
         times = bar_times(day)
 
+        # precompute each symbol's indicator series ONCE for the day
+        # (bit-identical values, ~10x faster; disable with use_pre=False)
+        pre_by_sym: dict = {}
+        if use_pre:
+            for s, bs in bars_by_sym.items():
+                pre_by_sym[s] = strat.precompute(bs) if bs else None
+
         # daily context for this day (no lookahead: strictly earlier days)
         ctx_by_sym: dict = {}
         for s in symbols:
@@ -91,6 +100,13 @@ def run_backtest(conn, start: str, end: str, symbols: list[str],
             t_str = (times[i].strftime("%Y-%m-%d %H:%M:%S")
                      if i < len(times) else None)
 
+            # per-bar slice of the precomputed series (aligned to bars[:i+1])
+            pre_i: dict = {}
+            if use_pre:
+                for s, bs in bars_by_sym.items():
+                    if i < len(bs) and pre_by_sym.get(s):
+                        pre_i[s] = {k: v[: i + 1] for k, v in pre_by_sym[s].items()}
+
             # ---------------- exits first (conservative ordering) ----------
             for s in list(positions.keys()):
                 bs = bars_by_sym[s]
@@ -100,7 +116,10 @@ def run_backtest(conn, start: str, end: str, symbols: list[str],
                 pos = positions[s]
                 call, new_stop = strat.evaluate_exit(
                     pos, bs[: i + 1], tick=None,
-                    now=parse_t(b.t), is_last_bar=(i == len(bs) - 1))
+                    now=parse_t(b.t), is_last_bar=(i == len(bs) - 1),
+                    pre=pre_i.get(s), bars_held=pos.get("held", 0))
+                if call is None:
+                    pos["held"] = pos.get("held", 0) + 1
                 if call:
                     fill = slip(call.price, "SELL")
                     fees = compute_fees("SELL", fill, pos["qty"])
@@ -123,10 +142,10 @@ def run_backtest(conn, start: str, end: str, symbols: list[str],
                     pos["stop"] = new_stop  # trail (in-place, persisted per-day only)
 
             # ---------------- entries --------------------------------------
-            if len(positions) < config.MAX_POSITIONS:
+            if len(positions) < cfg.MAX_POSITIONS:
                 for s in symbols:
                     bs = bars_by_sym[s]
-                    if i < config.WARMUP_BARS - 1 or i >= len(bs) or s in positions:
+                    if i < cfg.WARMUP_BARS - 1 or i >= len(bs) or s in positions:
                         continue
                     b = bs[i]
                     plan, sigs, skip = strat.evaluate_entry(
@@ -135,7 +154,7 @@ def run_backtest(conn, start: str, end: str, symbols: list[str],
                         equity=cash + sum(p["qty"] * bars_by_sym[p["symbol"]][i].c
                                           for p in positions.values()
                                           if i < len(bars_by_sym[p["symbol"]])),
-                        cash=cash)
+                        cash=cash, pre=pre_i.get(s))
                     if not plan:
                         continue
                     fill = slip(b.c, "BUY")
@@ -149,6 +168,7 @@ def run_backtest(conn, start: str, end: str, symbols: list[str],
                         "entry_time": b.t, "stop": plan.stop, "target": plan.target,
                         "atr_entry": plan.atr, "fees_buy": fees["total"],
                         "entry_note": plan.reason, "z": plan.z, "day": day,
+                        "held": 0,
                     }
                     if not quiet:
                         print(f"  [{day} {b.t[11:16]}] ENTRY {s:<11} "
@@ -190,11 +210,12 @@ def run_backtest(conn, start: str, end: str, symbols: list[str],
 
     # ------------------------------------------------------------------ stats
     return _stats(conn, start, end, days, trades, equity_pts,
-                  start_equity, realized, cash)
+                  start_equity, realized, cash, cfg)
 
 
 def _stats(conn, start, end, days, trades, equity_pts, start_equity,
-           realized, cash) -> dict:
+           realized, cash, cfg=None) -> dict:
+    cfg = cfg or config
     wins = [t for t in trades if t["pnl_net"] > 0]
     losses = [t for t in trades if t["pnl_net"] <= 0]
     gross_win = sum(t["pnl_net"] for t in wins)
@@ -235,12 +256,19 @@ def _stats(conn, start, end, days, trades, equity_pts, start_equity,
         if sd > 1e-12:
             sharpe = mu / sd * math.sqrt(252)
 
+    # CAGR: period return annualised over 252 trading days
+    cagr = None
+    if len(daily_eq) >= 2:
+        e0, e1 = daily_eq[sorted(daily_eq)[0]], daily_eq[sorted(daily_eq)[-1]]
+        if e0 > 0 and e1 > 0:
+            cagr = (e1 / e0) ** (252.0 / len(daily_eq)) - 1.0
+
     # avg holding bars
     hold = []
     for t in trades:
         try:
             hold.append((parse_t(t["exit_time"]) - parse_t(t["entry_time"])).total_seconds()
-                        / (config.BAR_MINUTES * 60))
+                        / (cfg.BAR_MINUTES * 60))
         except Exception:
             pass
 
@@ -257,6 +285,8 @@ def _stats(conn, start, end, days, trades, equity_pts, start_equity,
         if gross_win > 0 else 0.0,
         "max_dd_pct": max_dd * 100,
         "sharpe": sharpe,
+        "cagr": cagr,
+        "n_days": len(daily_eq),
         "avg_hold_bars": (sum(hold) / len(hold)) if hold else 0.0,
         "by_reason": by_reason, "by_symbol": by_symbol, "by_day": by_day,
     }
@@ -281,6 +311,7 @@ def print_report(res: dict) -> None:
         ["win rate", f"{res['win_rate']:.1f}%  ({res['n_wins']}W / {res['n_trades'] - res['n_wins']}L)"],
         ["avg win / avg loss", f"INR {signed(res['avg_win'])} / INR {signed(res['avg_loss'])}"],
         ["profit factor", f"{res['profit_factor']:.2f}" if res["profit_factor"] != float("inf") else "inf"],
+        ["CAGR (annualized)", f"{pct((res['cagr'] or 0) * 100)}  over {res['n_days']} days" if res["cagr"] is not None else "n/a (need >=2 days)"],
         ["max drawdown", pct(res["max_dd_pct"], 2)],
         ["sharpe (daily, ann.)", f"{res['sharpe']:.2f}" if res["sharpe"] is not None else "n/a"],
         ["avg holding", f"{res['avg_hold_bars']:.1f} bars ({res['avg_hold_bars'] * 5:.0f} min)"],
@@ -330,10 +361,11 @@ def write_report(res: dict, path) -> None:
     pf = res["profit_factor"]
     L.append(f"- Profit factor: {pf:.2f}" if pf != float("inf")
              else "- Profit factor: inf")
-    L.append(f"- Max drawdown: {res['max_dd_pct']:.2f}% | "
-             f"Sharpe (daily, ann.): "
-             f"{res['sharpe']:.2f}" if res["sharpe"] is not None
-             else f"- Max drawdown: {res['max_dd_pct']:.2f}% | Sharpe: n/a")
+    cagr_txt = (f"{res['cagr'] * 100:+.1f}% over {res['n_days']} days"
+                if res["cagr"] is not None else "n/a")
+    sharpe_txt = f"{res['sharpe']:.2f}" if res["sharpe"] is not None else "n/a"
+    L.append(f"- **CAGR (annualized): {cagr_txt}** | Max drawdown: "
+             f"{res['max_dd_pct']:.2f}% | Sharpe (daily, ann.): {sharpe_txt}")
     L.append(f"- Avg holding: {res['avg_hold_bars']:.1f} bars "
              f"({res['avg_hold_bars'] * 5:.0f} min)")
     L.append(f"- End equity: INR {inr(res['end_equity'])}")
@@ -486,6 +518,11 @@ def main() -> int:
         cov = db.day_coverage(conn, d)
         present.update(cov)
     symbols = [s for s in symbols if s in present] or [s for s in config.load_universe() if s in present]
+
+    params = config.load_params()
+    if params and not a.quiet:
+        print(f"[params] tuned parameters active from {config.PARAMS_FILE}: "
+              f"{len(params)} overrides (delete the file to use defaults)")
 
     res = run_backtest(conn, start, end, symbols, a.equity, quiet=a.quiet)
     print()

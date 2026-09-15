@@ -25,12 +25,13 @@ z = (close - SMA20) / rolling_std20          (the mean-reversion statistic)
 | **Context** (daily, built pre-open, no lookahead) | daily close > SMA20 **and** SMA20 > SMA50 (uptrend bias); 20-day avg volume ≥ 50,000 (liquidity) |
 | **Scan / Selection** (5m, every bar) | a **dip** = within the last 6 bars (30 min) `z ≤ -1.2` and RSI(14) touched ≤ 35 |
 | **Entry** (on a bar close) | `z` back in `[-1.5, -0.4]` (still below the mean) **and** rising, **green bar** (close>open and close>prev close), RSI ≤ 55, no entries after 14:50 IST |
+| **Entry quality filters** | still **below day-VWAP** (classic intraday MR) · dip **depth ≥ 0.5×ATR(14)** (real pullback, not drift) · ATR(14) ≥ 0.08% of price (volatility must cover costs) |
 | **Risk** | stop = entry − 1.5×ATR(14) (clamped 0.30%–1.50%); qty = 0.5% equity risk, capped at 20% equity exposure and cash |
 | **Target** | **the mean itself**: SMA20 at entry. Reversion *is* the profit. |
-| **Exits** | `STOP` (tick or bar low, gap-through fills at open) · `TARGET` (price ≥ mean) · `MEAN` (bar close z ≥ -0.10) · `TRAIL` (after crossing the mean, stop ratchets to close − 1.0×ATR) · `EOD` (forced flat from 15:20 - intraday-only mandate) |
+| **Exits** | `STOP` (tick or bar low, gap-through fills at open) · `TARGET` (price ≥ mean) · `MEAN` (bar close z ≥ -0.10) · `TRAIL` (after crossing the mean, stop ratchets to close − 1.0×ATR) · `TIME` (no reversion after 8 bars / 40 min) · `EOD` (forced flat from 15:20 - intraday-only mandate) |
 
-Up to **5 concurrent positions**, one per symbol. All parameters live in
-`config.py`.
+Up to **5 concurrent positions**, one per symbol. **Every parameter is
+tunable** (see `config.py` and §7 Tuning).
 
 ## 2. Files
 
@@ -44,7 +45,9 @@ Up to **5 concurrent positions**, one per symbol. All parameters live in
 | `upstox_client.py` | Upstox v2 REST + OAuth2/2FA + fm_token + instrument master. Header documents every API limitation |
 | `execution.py` | `PaperBroker` (default) and `UpstoxBroker` (real), fee model, slippage |
 | `db.py` | SQLite schema + all persistence helpers (WAL mode, idempotent upserts) |
-| `backtest.py` | **Replay engine** over stored bars + reports + `--compare` live-vs-replay validation |
+| `backtest.py` | **Replay engine** over stored bars + CAGR/Sharpe/PF/DD reports + `--compare` live-vs-replay validation |
+| `tune.py` | **Walk-forward parameter optimizer** (train/test split, overfit gap table) → `data/best_params.json` |
+| `data_import.py` | Import REAL 5-min/daily OHLCV CSV exports (Upstox can't serve past intraday bars) |
 | `demo_data.py` | Deterministic synthetic data (tagged `source='demo'`) for offline validation |
 | `test_engine_sim.py` | Full live-engine simulation on a mock API: whole session + **restart safety** |
 | `verify_all.py` | Offline self-check (9 tests incl. the simulation) - `python verify_all.py` |
@@ -107,15 +110,65 @@ python backtest.py --seed-demo 10 --db data/demo.db   REM keep demo data isolate
 
 The replay uses the **same `strategy.py`** on the **same stored bars**, with
 conservative intra-bar exit emulation (stop before target in the same bar;
-gap-throughs fill at the open). Reports: `reports/backtest_*.md` + `_trades.csv`.
-`--compare` is the engine-validation check: it lines up every live paper trade
-in the DB against the replay (same symbol+day, entry within 0.5%).
+gap-throughs fill at the open). Reports: `reports/backtest_*.md` + `_trades.csv`
+(net P&L, **CAGR**, win rate, profit factor, max DD, Sharpe, per-symbol,
+per-reason, daily P&L). `--compare` is the engine-validation check: it lines
+up every live paper trade in the DB against the replay (same symbol+day, entry
+within 0.5%).
+
+### Importing REAL history (needed for serious tuning)
+
+Upstox cannot serve intraday bars before today (limitation #1). To backtest or
+tune on REAL Nifty-100 data, load any broker/vendor/screener CSV export once:
+
+```bat
+python main.py --import-csv nifty_5m.csv --kind 5m
+python main.py --import-csv RELIANCE_5m.csv --kind 5m --symbol RELIANCE
+python main.py --import-csv dailies.csv --kind daily --symbol RELIANCE
+```
+
+Auto-detected columns (`symbol/timestamp/open/high/low/close/volume` and
+common aliases; IST or epoch timestamps; idempotent re-import; tagged with
+`--source`). The engine also accumulates real bars day by day as you run it.
+
+### Tuning / optimization for profitability (`tune.py`)
+
+```bat
+python tune.py                              REM whole DB, default grid, 150 samples
+python tune.py --start 2026-08-01 --end 2026-09-15 --n-samples 300
+python tune.py --symbols RELIANCE,TCS,HDFCBANK --n-samples 400
+python tune.py --min-trades 20 --max-dd 2.5 --top-k 20
+python tune.py --no-write                   REM report only
+```
+
+How it works:
+* **Walk-forward**: the window is split (default 70/30). Candidates are
+  filtered on the **train** part by net P&L (with min-trades / max-DD
+  eligibility), then only the top-k are scored on the **out-of-sample test**
+  part. The result table shows train vs test side by side (P&L, **CAGR**, PF,
+  max DD, win%) so you can see the overfit gap.
+* **Search**: random coarse sampling over ~18 parameters (z-windows, dip
+  thresholds, entry band, exit rules, stop/trail multiples, time stop, VWAP /
+  depth / ATR filters, position count, risk per trade) over a 15M+ grid —
+  a 100-sample run takes ~2 minutes on 15 days x 90 symbols.
+* **Application**: the winner is written to `data/best_params.json`; the
+  **engine and backtest auto-load it** (their banners show "TUNED (n
+  overrides)"). Delete the file to return to `config.py` defaults.
+
+Honesty box: a parameter set can only be trusted on data you haven't tuned on.
+Tuning on `--seed-demo` synthetic data validates the machinery (and the
+demo numbers are *not* real market results). For real Nifty-100 tuning:
+accumulate/import several weeks of 5-min bars, run `tune.py`, then keep
+paper-trading the winner and let `--compare` verify live-vs-replay agreement
+before you consider real mode.
 
 ### Offline validation (no API, no network)
 
 ```bat
-python verify_all.py          REM 9 tests: indicators, fees, DB, strategy,
-                              REM broker, time, full pipeline, engine simulation
+python verify_all.py          REM 13 tests: indicators, fees, DB, strategy,
+                              REM broker, time, pipeline, precompute==raw,
+                              REM time-stop, tuner smoke, CSV import,
+                              REM full-session engine simulation w/ restart test
 python test_engine_sim.py     REM just the full-session simulation w/ restart test
 ```
 

@@ -86,6 +86,12 @@ TRAIL_ATR_MULT = 1.0          # after crossing the mean: stop trails close - 1.0
 RSI_N = 14
 ATR_N = 14
 
+# --- entry-quality refinements (all tunable; 0 / False disables) ---
+DIP_MIN_DEPTH_ATR = 0.5       # dip must be at least 0.5x ATR(14) deep (real pullback, not drift)
+USE_VWAP_FILTER = True        # only fade dips that are still below day-VWAP (classic intraday MR)
+TIME_STOP_BARS = 8            # exit if still below the mean after 8 bars (40 min) of holding
+MIN_ATR_PCT = 0.08            # skip names whose 5-min ATR is too quiet to cover costs
+
 # ---------------------------------------------------------------------------
 # Selection filters
 # ---------------------------------------------------------------------------
@@ -121,6 +127,53 @@ POLL_FAST_SEC = 8             # mid-bar poll cadence for positions + dip watchli
 API_MIN_INTERVAL_SEC = 0.25   # throttle between Upstox REST calls (rate-limit safety)
 API_TIMEOUT_SEC = 20
 API_MAX_RETRIES = 3
+
+# ---------------------------------------------------------------------------
+# Tuned-parameter overrides (written by tune.py, auto-loaded by engine/backtest)
+# ---------------------------------------------------------------------------
+PARAMS_FILE = DATA_DIR / "best_params.json"
+
+# Every parameter the strategy engine reacts to (used by make_cfg / tune.py)
+TUNABLES = [
+    "WARMUP_BARS", "SMOOTH_N",
+    "DIP_Z", "DIP_LOOKBACK", "DIP_RSI", "DIP_MIN_DEPTH_ATR",
+    "ENTRY_Z_MIN", "ENTRY_Z_MAX", "ENTRY_RSI_MAX", "USE_VWAP_FILTER",
+    "MIN_ATR_PCT", "TIME_STOP_BARS",
+    "EXIT_Z", "SL_ATR_MULT", "SL_MIN_PCT", "SL_MAX_PCT", "TRAIL_ATR_MULT",
+    "RSI_N", "ATR_N",
+    "TREND_FILTER", "MIN_DAILY_AVG_VOLUME",
+    "MAX_POSITIONS", "RISK_PER_TRADE_PCT", "MAX_POS_VALUE_PCT", "MIN_QTY",
+    "LAST_ENTRY_AT", "EOD_FLAT_AT", "BAR_MINUTES",
+]
+
+
+def make_cfg(overrides: dict | None = None):
+    """A plain namespace holding every tunable. `overrides` (e.g. from
+    best_params.json or the tuner) replaces defaults. Unknown keys are ignored."""
+    from types import SimpleNamespace
+    ns = SimpleNamespace()
+    for name in TUNABLES:
+        setattr(ns, name, globals()[name])
+    for k, v in (overrides or {}).items():
+        if k in TUNABLES:
+            setattr(ns, k, v)
+    return ns
+
+
+def load_params() -> dict:
+    """Tuned parameter overrides from PARAMS_FILE (empty dict if absent).
+    Accepts both a plain {param: value} mapping and the tune.py payload
+    (which nests the overrides under 'overrides')."""
+    if PARAMS_FILE.exists():
+        try:
+            d = json.loads(PARAMS_FILE.read_text(encoding="utf-8"))
+            if isinstance(d, dict):
+                if "overrides" in d and isinstance(d["overrides"], dict):
+                    return d["overrides"]
+                return d
+        except Exception as e:
+            print(f"[warn] could not read {PARAMS_FILE}: {e}")
+    return {}
 
 
 def load_universe() -> list[str]:

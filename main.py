@@ -7,6 +7,7 @@ main.py - STMR entry point (PAPER TRADE by default).
   python main.py --observe           # scan + log everything, place no orders
   python main.py --mode real --i-understand-real-risk
                                      # LIVE orders via Upstox (read README first!)
+  python main.py --import-csv FILE --kind 5m   # load real OHLCV history
 
 The engine itself may be started at ANY time:
   * before/after market hours it captures NO data and writes NO rows
@@ -118,8 +119,19 @@ def main() -> int:
     ap.add_argument("--quiet", action="store_true", help="less console chatter")
     ap.add_argument("--i-understand-real-risk", action="store_true",
                     help="required to run --mode real")
+    ap.add_argument("--import-csv", default=None, metavar="FILE",
+                    help="import a real OHLCV CSV into the DB and exit")
+    ap.add_argument("--kind", choices=["5m", "daily"], default="5m",
+                    help="bar kind for --import-csv")
+    ap.add_argument("--symbol", default=None,
+                    help="symbol for --import-csv when the CSV has no column")
+    ap.add_argument("--source", default="import",
+                    help="source tag for --import-csv rows")
     a = ap.parse_args()
 
+    if a.import_csv:
+        import data_import
+        return data_import.run(a.import_csv, a.kind, a.symbol, a.source, a.db)
     if a.status:
         return show_status(a.db)
 

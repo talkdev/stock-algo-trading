@@ -173,12 +173,22 @@ cnt = Counter((r["symbol"], r["bar_time"], r["kind"])
               for r in conn.execute("SELECT * FROM processed_bars"))
 assert all(v == 1 for v in cnt.values()), \
     f"a bar was processed twice! { [k for k, v in cnt.items() if v > 1][:5] }"
-# the position must have survived the restart (same trade id)
+# the injected position must have survived the restart: either still open
+# with the same id, or closed BY THE POST-RESTART ENGINE at/after 14:10
+# (a legitimate exit) - never silently lost
 if SYMS[0] in open_A:
-    pA, pB = open_A[SYMS[0]], open_B.get(SYMS[0])
+    pA = open_A[SYMS[0]]
     if pA["entry_time"] == f"{TODAY} 13:55:00":
-        assert pB is not None and pB["id"] == pA["id"], "position lost on restart!"
-        print(f"  position {SYMS[0]} id={pA['id']} restored across restart  OK")
+        p = db.get_position(conn, pA["id"])
+        assert p is not None, "position lost on restart!"
+        if p["exit_time"] is None:
+            assert p["symbol"] == SYMS[0]
+            print(f"  position {SYMS[0]} id={pA['id']} still open after restart  OK")
+        else:
+            assert p["exit_time"] >= f"{TODAY} 14:10:00", \
+                f"position closed before restart window: {p['exit_time']}"
+            print(f"  position {SYMS[0]} id={pA['id']} restored, then exited "
+                  f"by the restarted engine at {p['exit_time']} ({p['exit_reason']})  OK")
 
 # ---------------------------------------------------------------- phase C
 print("\n== phase C: resume 14:16 -> 15:29, then post-close ==")
@@ -208,5 +218,6 @@ assert daily_today == len(SYMS), "today's daily bar written post-close"
 assert list(config.REPORTS_DIR.glob("eod_*.md")), "EOD report missing"
 for t in closed:
     assert t["exit_time"][:10] == TODAY
-    assert t["exit_reason"] in ("STOP", "TARGET", "MEAN", "EOD", "DATA_END")
+    assert t["exit_reason"] in ("STOP", "TARGET", "MEAN", "EOD", "DATA_END",
+                                "TIME")
 print("\nSIMULATION GREEN - restart-safe, flat at EOD, clean DB, EOD report written.")

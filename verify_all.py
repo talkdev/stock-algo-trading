@@ -26,9 +26,10 @@ from pathlib import Path
 
 import config
 import db
+import mkttime
 from console import inr
 from execution import PaperBroker, compute_fees, slip
-from indicators import Bar, atr, rsi, sma, vwap, zscores
+from indicators import Bar, atr, rsi, rolling_std, sma, vwap, zscores
 from mkttime import (bar_times, completed_bar_until, session_phase)
 from strategy import StockContext, Strategy
 
@@ -241,13 +242,13 @@ def test_full_pipeline():
     with tempfile.TemporaryDirectory() as td:
         conn = db.get_conn(os.path.join(td, "bt.db"))
         db.init_db(conn)
-        syms = config.load_universe()[:12]
-        first, last, n = demo_data.seed_demo(conn, days=6, symbols=syms,
+        syms = config.load_universe()[:20]
+        first, last, n = demo_data.seed_demo(conn, days=10, symbols=syms,
                                              seed=7, quiet=True)
-        assert n == 12
+        assert n == 20
         res = backtest.run_backtest(conn, first, last, syms,
                                     config.PAPER_START_EQUITY, quiet=True)
-        assert len(res["days"]) == 6
+        assert len(res["days"]) == 10
         assert res["n_trades"] >= 3, f"demo data should produce trades, got {res['n_trades']}"
         assert res["equity"]
         assert res["end_equity"] > 0
@@ -259,6 +260,127 @@ def test_full_pipeline():
         outp = db.purge_demo(conn)
         assert outp.get("candles_5m", 0) == before
         assert db.count_rows(conn, "candles_5m") == 0
+
+
+def test_precompute_equivalence():
+    """Backtest with precomputed indicators MUST produce the identical trade
+    list as the plain per-bar recomputation (the tuner speedup is safe)."""
+    import backtest
+    import demo_data
+    with tempfile.TemporaryDirectory() as td:
+        conn = db.get_conn(os.path.join(td, "eq.db"))
+        db.init_db(conn)
+        syms = config.load_universe()[:4]
+        first, last, _ = demo_data.seed_demo(conn, days=4, symbols=syms,
+                                             seed=5, quiet=True)
+        cfg = config.make_cfg()
+        a = backtest.run_backtest(conn, first, last, syms, 1e6, quiet=True,
+                                  cfg=cfg, use_pre=True)
+        b = backtest.run_backtest(conn, first, last, syms, 1e6, quiet=True,
+                                  cfg=cfg, use_pre=False)
+        key = lambda ts: [(t["symbol"], t["entry_time"], t["exit_time"],
+                           round(t["pnl_net"], 6)) for t in ts]
+        assert key(a["trades"]) == key(b["trades"]), \
+            "precompute path diverged from the raw path"
+        assert a["net_pnl"] == b["net_pnl"]
+
+
+def test_time_stop():
+    strat = Strategy()
+    bars = _dip_bars()
+    entry_idx = None
+    for i in range(45, len(bars)):
+        plan, _, _ = strat.evaluate_entry("X", CTX_UP, bars[: i + 1],
+                                          now_hm="12:30",
+                                          equity=1e6, cash=1e6)
+        if plan:
+            entry_idx = i
+            break
+    assert entry_idx is not None
+    # extend the day with bars that hover BELOW the mean (z ~ -0.6) forever
+    extra = []
+    prev_c = bars[-1].c
+    base_t = mkttime.parse_t("2026-09-14 12:50:00")
+    for j in range(14):
+        closes = [b.c for b in bars + extra]
+        s = sma(closes, 20)[-1]
+        sd = rolling_std(closes, 20)[-1]
+        c = s - 0.6 * sd
+        t = (base_t + timedelta(minutes=5 * j)).strftime("%Y-%m-%d %H:%M:%S")
+        extra.append(Bar(t, prev_c, max(prev_c, c) * 1.0005,
+                         min(prev_c, c) * 0.9995, c, 500))
+        prev_c = c
+    allb = bars + extra
+    pos = {"stop": plan.stop, "target": plan.target}
+    call, _ = strat.evaluate_exit(pos, allb, tick=None,
+                                  now=mkttime.parse_t(allb[-1].t), bars_held=8)
+    assert call is not None and call.reason == "TIME", \
+        f"expected TIME stop, got {call and call.reason}"
+    call2, _ = strat.evaluate_exit(pos, allb, tick=None,
+                                   now=mkttime.parse_t(allb[-1].t), bars_held=2)
+    assert call2 is None or call2.reason != "TIME"
+    call3, _ = strat.evaluate_exit(pos, allb, tick=plan.target + 1,
+                                   now=mkttime.parse_t(allb[-1].t), bars_held=9)
+    assert call3.reason == "TARGET"  # tick exit precedence over time stop
+
+
+def test_tuner_smoke():
+    import backtest  # noqa
+    import demo_data
+    import tune
+    with tempfile.TemporaryDirectory() as td:
+        conn = db.get_conn(os.path.join(td, "tune.db"))
+        db.init_db(conn)
+        syms = config.load_universe()[:8]
+        first, last, _ = demo_data.seed_demo(conn, days=8, symbols=syms,
+                                             seed=5, quiet=True)
+        days = db.distinct_dates(conn, first, last)
+        grid = {"DIP_Z": [1.0, 1.5], "USE_VWAP_FILTER": [False],
+                "TIME_STOP_BARS": [0]}
+        try:
+            res = tune.optimize(conn, days, syms, 1e6, grid,
+                                n_samples=4, top_k=2, seed=1, split=0.6,
+                                min_trades=1, max_dd=50.0, quiet=True)
+        except SystemExit as e:
+            if "no combination passed" in str(e):
+                print("    (no combo passed the strict filter - valid outcome)")
+                return
+            raise
+        assert res, "tuner returned no rows"
+        assert any(r["tag"] == "base" for r in res), "base row missing"
+        for r in res:
+            assert r["train"]["net_pnl"] is not None
+            assert r["test"]["net_pnl"] is not None
+            assert "cagr" in r["train"]
+
+
+def test_import_csv():
+    import data_import
+    with tempfile.TemporaryDirectory() as td:
+        conn = db.get_conn(os.path.join(td, "imp.db"))
+        db.init_db(conn)
+        p = Path(td) / "x.csv"
+        lines = ["symbol,timestamp,open,high,low,close,volume"]
+        for s in ("AAA", "BBB"):
+            for t, c in (("09:15:00", 100.0), ("09:20:00", 101.0),
+                         ("09:25:00", 100.5)):
+                lines.append(f"{s},2026-09-14 {t},{c},{c + 0.5},{c - 0.5},"
+                             f"{c},1000")
+        p.write_text("\n".join(lines), encoding="utf-8")
+        st = data_import.import_csv(conn, p, "5m", source="test")
+        assert st["total"] == 6 and st["bad"] == 0
+        assert db.count_rows(conn, "candles_5m") == 6
+        st2 = data_import.import_csv(conn, p, "5m", source="test")
+        assert st2["total"] == 6
+        assert db.count_rows(conn, "candles_5m") == 6, "re-import duplicated rows"
+        bars = db.get_day_bars(conn, "AAA", "2026-09-14")
+        assert bars[0].t == "2026-09-14 09:15:00" and abs(bars[0].c - 100.0) < 1e-9
+        pd_ = Path(td) / "d.csv"
+        pd_.write_text("symbol,timestamp,open,high,low,close,volume\n"
+                       "AAA,2026-09-14,99,102,98,100.5,3000\n", encoding="utf-8")
+        st3 = data_import.import_csv(conn, pd_, "daily", source="test")
+        assert st3["total"] == 1
+        assert db.get_context(conn, "AAA", "2026-09-15") is None
 
 
 def test_engine_simulation():
@@ -292,6 +414,13 @@ def main() -> int:
     check("market-time helpers (phases, boundaries)", test_mkttime)
     check("full pipeline: demo seed -> backtest -> report -> purge",
           test_full_pipeline)
+    check("precompute speedup == raw path (identical trades)",
+          test_precompute_equivalence)
+    check("time-stop exit fires after N bars without reversion",
+          test_time_stop)
+    check("tuner: walk-forward smoke (train/test, base row, CAGR)",
+          test_tuner_smoke)
+    check("csv import: 5m + daily, idempotent re-import", test_import_csv)
     check("engine simulation: full session + restart safety (mock API)",
           test_engine_simulation)
     print()

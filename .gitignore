@@ -3,6 +3,7 @@ __pycache__/
 data/*.db
 *.db-wal
 *.db-shm
+data/best_params.json
 data/upstox_token.json
 data/upstox_fm_token.json
 data/instrument_master.csv
