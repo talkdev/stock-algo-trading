@@ -92,6 +92,19 @@ USE_VWAP_FILTER = True        # only fade dips that are still below day-VWAP (cl
 TIME_STOP_BARS = 8            # exit if still below the mean after 8 bars (40 min) of holding
 MIN_ATR_PCT = 0.08            # skip names whose 5-min ATR is too quiet to cover costs
 
+# --- desk risk layer (what separates a strategy from a desk) ---
+EARLY_ENTRY_CUTOFF = "09:45"  # no entries before opening stabilization (auction noise)
+MAX_ATR_PCT = 1.50            # skip event-driven names whose 5-min ATR is too extreme
+MIN_BAR_CLOSE_POS = 0.50      # entry bar must close in the top half of its own range (0 = off)
+DAILY_LOSS_LIMIT_PCT = 1.5    # halt new entries for the day once day P&L <= -X% of day-start equity
+MAX_TRADES_PER_DAY = 12       # overtrade / cost guard
+STOP_COOLDOWN_BARS = 6        # after a STOP out, no re-entry in the same symbol for N bars
+
+# --- partial profit-taking (the classic MR money-maker) ---
+PARTIAL_PCT = 50.0            # % of the position sold at target-1 (the mean); 0 = off
+BE_AFTER_PARTIAL = True       # after the partial, move the stop to breakeven
+R_MULT_TARGET2 = 1.5          # runner target: entry + (entry - stop) * R_MULT
+
 # ---------------------------------------------------------------------------
 # Selection filters
 # ---------------------------------------------------------------------------
@@ -138,9 +151,12 @@ TUNABLES = [
     "WARMUP_BARS", "SMOOTH_N",
     "DIP_Z", "DIP_LOOKBACK", "DIP_RSI", "DIP_MIN_DEPTH_ATR",
     "ENTRY_Z_MIN", "ENTRY_Z_MAX", "ENTRY_RSI_MAX", "USE_VWAP_FILTER",
-    "MIN_ATR_PCT", "TIME_STOP_BARS",
+    "MIN_ATR_PCT", "MAX_ATR_PCT", "MIN_BAR_CLOSE_POS", "EARLY_ENTRY_CUTOFF",
+    "TIME_STOP_BARS",
     "EXIT_Z", "SL_ATR_MULT", "SL_MIN_PCT", "SL_MAX_PCT", "TRAIL_ATR_MULT",
     "RSI_N", "ATR_N",
+    "PARTIAL_PCT", "BE_AFTER_PARTIAL", "R_MULT_TARGET2",
+    "DAILY_LOSS_LIMIT_PCT", "MAX_TRADES_PER_DAY", "STOP_COOLDOWN_BARS",
     "TREND_FILTER", "MIN_DAILY_AVG_VOLUME",
     "MAX_POSITIONS", "RISK_PER_TRADE_PCT", "MAX_POS_VALUE_PCT", "MIN_QTY",
     "LAST_ENTRY_AT", "EOD_FLAT_AT", "BAR_MINUTES",

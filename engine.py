@@ -44,6 +44,27 @@ from strategy import ExitCall, StockContext, Strategy
 from upstox_client import UpstoxError
 
 
+def _remaining(p) -> int:
+    try:
+        return p["qty_remaining"]
+    except (IndexError, KeyError):
+        return p["qty"]
+
+
+def _partial_count(p) -> int:
+    try:
+        return p["partial_count"]
+    except (IndexError, KeyError):
+        return 0
+
+
+def _realized(p) -> float:
+    try:
+        return p["realized_pnl"]
+    except (IndexError, KeyError):
+        return 0.0
+
+
 class Engine:
     def __init__(self, mode: str = "paper", once: bool = False,
                  observe: bool = False, db_path=None, quiet: bool = False):
@@ -74,6 +95,7 @@ class Engine:
         self._closed_log = 0.0
         self._api_warned = False
         self._holiday_logged = False
+        self._halted = False
 
     # ------------------------------------------------------------------ boot
     def _restore_state(self) -> None:
@@ -83,6 +105,12 @@ class Engine:
             "SELECT symbol, MAX(bar_time) AS m FROM candles_5m "
             "WHERE bar_time LIKE ? GROUP BY symbol", (today + " %",)).fetchall()
         self.last_completed = {r["symbol"]: r["m"] for r in rows if r["m"]}
+
+        # restore today's kill-switch state (restart-safe)
+        self._halted = db.get_meta(self.conn, f"halt_{today}") == "1"
+        if self._halted:
+            print("[info] daily loss kill-switch was active today - "
+                  "restored, no new entries until the next session.")
 
         for p in db.get_open_positions(self.conn):
             if not p["entry_time"].startswith(today):
@@ -126,9 +154,13 @@ class Engine:
         if pos:
             print("  open positions (restored from DB):")
             for p in pos:
-                print(f"    {p['symbol']:<11} {p['qty']:>5} @ {p['entry_fill']:.2f}  "
+                rem = _remaining(p)
+                part = (f"  [{_partial_count(p)} partial(s), "
+                        f"realized {signed(_realized(p))}]"
+                        if _partial_count(p) else "")
+                print(f"    {p['symbol']:<11} {rem:>5} @ {p['entry_fill']:.2f}  "
                       f"stop {p['stop']:.2f}  target {p['target']:.2f}  "
-                      f"entry {p['entry_time']}")
+                      f"entry {p['entry_time']}{part}")
 
     # ------------------------------------------------------------------- run
     def run(self) -> None:
@@ -345,15 +377,17 @@ class Engine:
             call, new_stop = self.strat.evaluate_exit(p, bars, tick=None, now=now,
                                                       pre=pre, bars_held=bars_held)
             if call:
-                pnl = (self.broker.sell(p["id"], call.price, bar_t, call.reason,
-                                        call.note)
-                       if self.mode == "paper" else
-                       self._real_sell(p, call, bar_t))
-                exits.append(sym)
-                db.record_signal(self.conn, now_str(), sym, bar_t, "EXIT",
-                                 call.price, m["z"], m["rsi"], m["atr"],
-                                 f"{call.reason}: {call.note}", "live")
-                self._say_exit(sym, p, call, pnl, bar_t)
+                pnl, reason, partial = self._execute_exit(p, call, bar_t)
+                if partial:
+                    db.record_signal(self.conn, now_str(), sym, bar_t, "PARTIAL",
+                                     call.price, m["z"], m["rsi"], m["atr"],
+                                     call.note, "live")
+                else:
+                    exits.append(sym)
+                    db.record_signal(self.conn, now_str(), sym, bar_t, "EXIT",
+                                     call.price, m["z"], m["rsi"], m["atr"],
+                                     f"{reason}: {call.note}", "live")
+                    self._say_exit(sym, p, call, pnl, bar_t, reason)
             elif new_stop > p["stop"] + 1e-9:
                 db.update_position(self.conn, p["id"], stop=new_stop)
                 db.record_signal(self.conn, now_str(), sym, bar_t, "TRAIL",
@@ -366,6 +400,9 @@ class Engine:
         # ---- 2) entries (only when flat on this symbol and slot available)
         open_pos = db.get_open_positions(self.conn)
         if p is None and len(open_pos) < self.cfg.MAX_POSITIONS:
+            blocked = self._entry_blocked(date, sym, bar_t)
+            if blocked:
+                return
             now_hm = bar_t[11:16]
             if self.mode == "paper":
                 _, equity = self.broker.equity(self.broker.last_prices([sym]))
@@ -414,13 +451,73 @@ class Engine:
             entries.append(plan.symbol)
             self._say_entry(plan)
 
-    def _real_sell(self, p, call: ExitCall, t: str):
+    def _execute_exit(self, p, call: ExitCall, t: str):
+        """Execute an exit call with desk partial-profit rules.
+        Returns (total_pnl | None, reason, partial_happened)."""
+        if call.reason == "TARGET":
+            act = self.strat.plan_target_exit(p)
+            if act["action"] == "partial":
+                try:
+                    slice_pnl = self.broker.sell_partial(
+                        p["id"], call.price, act["qty"], t, "PARTIAL", act["note"])
+                except Exception as e:
+                    db.log_event(self.conn, "ERROR",
+                                 f"partial sell {p['symbol']}: {e!r}")
+                    print(f"[ERROR] partial sell failed for {p['symbol']}: {e}")
+                    slice_pnl = None
+                if slice_pnl is not None:
+                    db.update_position(self.conn, p["id"], stop=act["new_stop"],
+                                       target=act["target2"])
+                    self._say(f"  PART   {p['symbol']:<11} {act['note']} | "
+                              f"slice pnl {signed(slice_pnl)}", level="ok")
+                    return None, "PARTIAL", True
+        reason = ("TARGET2" if call.reason == "TARGET"
+                  and (p["partial_count"] or 0) > 0 else call.reason)
         try:
-            return self.broker.sell(p["id"], call.price, t, call.reason, call.note)
+            pnl = (self.broker.sell(p["id"], call.price, t, reason, call.note)
+                   if self.mode == "paper" else
+                   self._real_sell(p, call, t, reason))
+        except Exception as e:
+            db.log_event(self.conn, "ERROR", f"sell {p['symbol']}: {e!r}")
+            print(f"[ERROR] sell failed for {p['symbol']}: {e}")
+            pnl = None
+        return pnl, reason, False
+
+    def _real_sell(self, p, call: ExitCall, t: str, reason: str | None = None):
+        try:
+            return self.broker.sell(p["id"], call.price, t,
+                                    reason or call.reason, call.note)
         except Exception as e:
             db.log_event(self.conn, "ERROR", f"real sell {p['symbol']}: {e!r}")
             print(f"[ERROR] real sell failed for {p['symbol']}: {e}")
             return None
+
+    def _entry_blocked(self, date: str, sym: str, bar_t: str):
+        """Desk guards on new entries. Returns a block reason or None."""
+        n_today = self.conn.execute(
+            "SELECT COUNT(*) AS n FROM trades WHERE entry_time LIKE ?",
+            (date + " %",)).fetchone()["n"]
+        if n_today >= self.cfg.MAX_TRADES_PER_DAY:
+            self._say(f"  GUARD  {sym:<11} skipped: daily trade cap "
+                      f"({self.cfg.MAX_TRADES_PER_DAY}/day)", once_per=300)
+            return "trade-cap"
+        if self.cfg.STOP_COOLDOWN_BARS > 0:
+            r = self.conn.execute(
+                "SELECT MAX(exit_time) AS m FROM trades WHERE symbol=? "
+                "AND exit_reason='STOP' AND exit_time LIKE ?",
+                (sym, date + " %")).fetchone()
+            if r and r["m"]:
+                mins = (parse_t(bar_t) - parse_t(r["m"])).total_seconds() / 60
+                if mins < self.cfg.STOP_COOLDOWN_BARS * config.BAR_MINUTES:
+                    self._say(f"  GUARD  {sym:<11} skipped: cooldown "
+                              f"({self.cfg.STOP_COOLDOWN_BARS} bars) after "
+                              f"stop-out at {r['m'][11:16]}", once_per=60)
+                    return "cooldown"
+        if self._halted:
+            self._say(f"  GUARD  {sym:<11} skipped: daily loss kill-switch "
+                      f"active", once_per=300)
+            return "loss-limit"
+        return None
 
     # ------------------------------------------------------------- live watch
     def _live_watch(self, date: str, now: datetime) -> None:
@@ -447,14 +544,13 @@ class Engine:
             call, new_stop = self.strat.evaluate_exit(p, bars,
                                                       tick=live_bar.c, now=now)
             if call:
-                pnl = (self.broker.sell(p["id"], call.price, fmt_t(now),
-                                        call.reason, call.note)
-                       if self.mode == "paper" else
-                       self._real_sell(p, call, fmt_t(now)))
-                db.record_signal(self.conn, now_str(), s, live_bar.t, "EXIT",
+                pnl, reason, partial = self._execute_exit(p, call, fmt_t(now))
+                db.record_signal(self.conn, now_str(), s, live_bar.t,
+                                 "PARTIAL" if partial else "EXIT",
                                  call.price, None, None, None,
-                                 f"{call.reason}: {call.note} (tick)", "live")
-                self._say_exit(s, p, call, pnl, fmt_t(now))
+                                 f"{reason}: {call.note} (tick)", "live")
+                if not partial:
+                    self._say_exit(s, p, call, pnl, fmt_t(now), reason)
             elif new_stop > p["stop"] + 1e-9:
                 db.update_position(self.conn, p["id"], stop=new_stop)
                 db.record_signal(self.conn, now_str(), s, live_bar.t, "TRAIL",
@@ -550,6 +646,20 @@ class Engine:
         realized = db.closed_pnl_on(self.conn, date)
         db.append_equity(self.conn, now_str(), cash, equity,
                          len(db.get_open_positions(self.conn)), realized, "OPEN")
+        # --- desk guard: daily-loss kill-switch (checked once per pass) ---
+        if self.cfg.DAILY_LOSS_LIMIT_PCT > 0 and not self._halted:
+            eq_start = db.get_meta(self.conn, f"eq_start_{date}")
+            if not eq_start:
+                db.set_meta(self.conn, f"eq_start_{date}", str(equity))
+                self.conn.commit()
+            elif equity <= float(eq_start) * (1 - self.cfg.DAILY_LOSS_LIMIT_PCT / 100):
+                self._halted = True
+                db.set_meta(self.conn, f"halt_{date}", "1")
+                self.conn.commit()
+                self._say(f"  DESK   daily loss limit -{self.cfg.DAILY_LOSS_LIMIT_PCT:.2f}% "
+                          f"breached (equity {inr(equity)} vs day start "
+                          f"{inr(float(eq_start))}) -> NO MORE ENTRIES TODAY",
+                          level="warn")
         self.conn.commit()
 
     # ------------------------------------------------------------- messaging
@@ -585,7 +695,8 @@ class Engine:
         print(f"              risk: {risk_amt / equity * 100:.2f}% of equity "
               f"(INR {inr(risk_amt)}) | value INR {inr(plan.price * plan.qty)}")
 
-    def _say_exit(self, sym: str, p, call: ExitCall, pnl, t: str) -> None:
+    def _say_exit(self, sym: str, p, call: ExitCall, pnl, t: str,
+                  reason: str | None = None) -> None:
         pnl_txt = (f"INR {signed(pnl)} (net of fees)"
                    if pnl is not None else "n/a (real mode fill pending?)")
         held = ""
@@ -594,8 +705,8 @@ class Engine:
             held = f" | held {int(mins)} min"
         except Exception:
             pass
-        print(f"[{now_str()}] + EXIT  {sym:<11} SELL {p['qty']} @ {call.price:.2f}  "
-              f"reason: {call.reason}")
+        print(f"[{now_str()}] + EXIT  {sym:<11} SELL {_remaining(p)} @ {call.price:.2f}  "
+              f"reason: {reason or call.reason}")
         print(f"              why : {call.note}")
         print(f"              pnl : {pnl_txt}{held}")
 

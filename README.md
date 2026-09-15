@@ -27,8 +27,9 @@ z = (close - SMA20) / rolling_std20          (the mean-reversion statistic)
 | **Entry** (on a bar close) | `z` back in `[-1.5, -0.4]` (still below the mean) **and** rising, **green bar** (close>open and close>prev close), RSI ≤ 55, no entries after 14:50 IST |
 | **Entry quality filters** | still **below day-VWAP** (classic intraday MR) · dip **depth ≥ 0.5×ATR(14)** (real pullback, not drift) · ATR(14) ≥ 0.08% of price (volatility must cover costs) |
 | **Risk** | stop = entry − 1.5×ATR(14) (clamped 0.30%–1.50%); qty = 0.5% equity risk, capped at 20% equity exposure and cash |
-| **Target** | **the mean itself**: SMA20 at entry. Reversion *is* the profit. |
-| **Exits** | `STOP` (tick or bar low, gap-through fills at open) · `TARGET` (price ≥ mean) · `MEAN` (bar close z ≥ -0.10) · `TRAIL` (after crossing the mean, stop ratchets to close − 1.0×ATR) · `TIME` (no reversion after 8 bars / 40 min) · `EOD` (forced flat from 15:20 - intraday-only mandate) |
+| **Target (desk money-maker)** | **the mean itself**: SMA20 at entry. On the first touch: sell **PARTIAL_PCT** (default 40–50%) to lock the reversion, move the stop to **breakeven**, and let the remainder run to **target-2 = entry + R_MULT × (entry − stop)** (default 1.5R). The runner is then a free trade. |
+| **Exits** | `STOP` (tick or bar low, gap-through fills at open) · `PARTIAL` (slice sold at the mean; position continues) · `TARGET2` (runner closes at the second target) · `MEAN` (bar close z ≥ -0.10) · `TRAIL` (after crossing the mean, stop ratchets to close − 1.0×ATR) · `TIME` (no reversion after 8 bars / 40 min) · `EOD` (forced flat from 15:20 - intraday-only mandate) |
+| **Desk guards** (entry gates) | no entries before **09:45** (auction noise) · skip **event-regime** names (5-min ATR > 1.5% of price) · entry bar must not close in the bottom half of its own range · **daily-loss kill-switch** (−1.5% vs day-start equity → no more entries today) · **max 12 entries/day** · **6-bar per-symbol cooldown after a stop-out** |
 
 Up to **5 concurrent positions**, one per symbol. **Every parameter is
 tunable** (see `config.py` and §7 Tuning).
@@ -46,11 +47,11 @@ tunable** (see `config.py` and §7 Tuning).
 | `execution.py` | `PaperBroker` (default) and `UpstoxBroker` (real), fee model, slippage |
 | `db.py` | SQLite schema + all persistence helpers (WAL mode, idempotent upserts) |
 | `backtest.py` | **Replay engine** over stored bars + CAGR/Sharpe/PF/DD reports + `--compare` live-vs-replay validation |
-| `tune.py` | **Walk-forward parameter optimizer** (train/test split, overfit gap table) → `data/best_params.json` |
+| `tune.py` | **Walk-forward parameter optimizer v2** (anchored folds, selectable objective, constraints, local refinement, overfit z-score, desk memo) → `data/best_params.json` |
 | `data_import.py` | Import REAL 5-min/daily OHLCV CSV exports (Upstox can't serve past intraday bars) |
 | `demo_data.py` | Deterministic synthetic data (tagged `source='demo'`) for offline validation |
 | `test_engine_sim.py` | Full live-engine simulation on a mock API: whole session + **restart safety** |
-| `verify_all.py` | Offline self-check (9 tests incl. the simulation) - `python verify_all.py` |
+| `verify_all.py` | Offline self-check (17 tests incl. partial accounting, desk guards, tuner folds and the full-session simulation) - `python verify_all.py` |
 | `patch.py` | DB maintenance: status / integrity / migrate / purge-demo / reset |
 | `config.py` | Every tunable (strategy, risk, fees, session times, API) |
 | `stock_universe.json` | The 90 Nifty-100 symbols |
@@ -131,26 +132,48 @@ Auto-detected columns (`symbol/timestamp/open/high/low/close/volume` and
 common aliases; IST or epoch timestamps; idempotent re-import; tagged with
 `--source`). The engine also accumulates real bars day by day as you run it.
 
-### Tuning / optimization for profitability (`tune.py`)
+### Tuning / optimization for profitability (`tune.py` v2)
 
 ```bat
-python tune.py                              REM whole DB, default grid, 150 samples
+python tune.py                               REM whole DB, 1 fold (classic train/test)
+python tune.py --folds 3 --objective calmar  REM desk-standard: 3 anchored folds
+python tune.py --folds 3 --objective sharpe --min-wr 55 --max-hold-bars 8
 python tune.py --start 2026-08-01 --end 2026-09-15 --n-samples 300
 python tune.py --symbols RELIANCE,TCS,HDFCBANK --n-samples 400
-python tune.py --min-trades 20 --max-dd 2.5 --top-k 20
-python tune.py --no-write                   REM report only
+python tune.py --refine 20                   REM + local refinement stage
+python tune.py --no-write                    REM report only
 ```
 
-How it works:
-* **Walk-forward**: the window is split (default 70/30). Candidates are
-  filtered on the **train** part by net P&L (with min-trades / max-DD
-  eligibility), then only the top-k are scored on the **out-of-sample test**
-  part. The result table shows train vs test side by side (P&L, **CAGR**, PF,
-  max DD, win%) so you can see the overfit gap.
-* **Search**: random coarse sampling over ~18 parameters (z-windows, dip
+How it works (v2, "desk edition"):
+* **Anchored walk-forward folds** (`--folds N`): the train window always
+  starts at day 1 and **expands** fold by fold; each fold is validated on the
+  next slice of days the search never saw. The last fold covers the most
+  recent sessions - the regime the strategy is most likely to face. A combo
+  that only works on one fold is regime-luck, not edge.
+* **Selectable objective** (`--objective pnl|cagr|calmar|sharpe`): P&L alone
+  rewards risk-on behaviour; desks rank on risk-adjusted figures. Calmar =
+  annualized CAGR% / max DD%; sharpe = daily (annualized) sharpe of the
+  equity curve.
+* **Constraints** (`--min-trades --max-dd --min-wr --max-hold-bars`):
+  eligibility filters applied to **every** fold's test slice (min trades is
+  scaled to the slice length). A combo is only eligible if it passes on all
+  folds.
+* **Local refinement** (`--refine N`): after the coarse pass, the top-3
+  combos are perturbed one grid step at a time, the neighbourhood is scored
+  on the largest train window, and the best N perturbations join the fold
+  evaluation - so you don't stop one grid step from the optimum.
+* **Overfit z-score**: the winner's train objective is expressed in
+  standard deviations from the distribution of ALL trials. High z with a
+  weak out-of-sample fold is the classic overfit signature - the desk memo
+  prints both numbers.
+* **Desk memo** (`reports/tune_*.md`): short markdown record of the run -
+  window, objective, constraints, per-fold table, winner rationale,
+  caveats.
+* **Search**: random coarse sampling over ~30 parameters (z-windows, dip
   thresholds, entry band, exit rules, stop/trail multiples, time stop, VWAP /
-  depth / ATR filters, position count, risk per trade) over a 15M+ grid —
-  a 100-sample run takes ~2 minutes on 15 days x 90 symbols.
+  depth / ATR filters, position count, risk per trade **and the whole desk
+  layer**: partial %, runner R-multiple, cutoff, ATR cap, bar-strength,
+  loss limit, trade cap, cooldown) over a 130B+ grid.
 * **Application**: the winner is written to `data/best_params.json`; the
   **engine and backtest auto-load it** (their banners show "TUNED (n
   overrides)"). Delete the file to return to `config.py` defaults.
@@ -158,17 +181,40 @@ How it works:
 Honesty box: a parameter set can only be trusted on data you haven't tuned on.
 Tuning on `--seed-demo` synthetic data validates the machinery (and the
 demo numbers are *not* real market results). For real Nifty-100 tuning:
-accumulate/import several weeks of 5-min bars, run `tune.py`, then keep
+accumulate/import several weeks of 5-min bars, run
+`python tune.py --folds 3 --objective calmar --refine 20`, then keep
 paper-trading the winner and let `--compare` verify live-vs-replay agreement
-before you consider real mode.
+before you consider real mode. On windows of ≤ ~20 sessions the per-fold
+slices are small: prefer combos that are positive on **every** fold.
+
+### The desk risk layer (v2)
+
+The entry/exit machinery above is wrapped in the same guard set a small
+proprietary desk would run intraday:
+
+| Guard | What it does | Param |
+|---|---|---|
+| **Partial profit-taking** | sells `PARTIAL_PCT` at target-1 (the mean), moves stop to breakeven, runs the rest to `R_MULT_TARGET2` × R (reason `TARGET2` on the final close). The backtest and live engine share the same `plan_target_exit()` code, so numbers transfer 1:1. | `PARTIAL_PCT`, `BE_AFTER_PARTIAL`, `R_MULT_TARGET2` |
+| **Opening-noise cutoff** | no new entries before `EARLY_ENTRY_CUTOFF` (default 09:45) - the first bars after the opening auction are pure noise. | `EARLY_ENTRY_CUTOFF` |
+| **Event-regime ATR cap** | skips names whose 5-min ATR is a runaway fraction of price (news, orders, results) - MR stops working in event regimes. | `MAX_ATR_PCT` |
+| **Bar-strength filter** | the entry bar must close in the top part of its own range (a reclaim that closes near its low is a trap, not a reversal). | `MIN_BAR_CLOSE_POS` |
+| **Daily-loss kill-switch** | once equity ≤ day-start × (1 − `DAILY_LOSS_LIMIT_PCT`/100), **no more entries that day** (exits/trailing still run). Survives restarts via `meta`. | `DAILY_LOSS_LIMIT_PCT` |
+| **Max trades per day** | hard cap on daily entries (overtrade / cost guard). | `MAX_TRADES_PER_DAY` |
+| **Post-stop cooldown** | after a `STOP`-out, the same symbol is not re-entered for `STOP_COOLDOWN_BARS` bars (fighting a name that just broke the level is how blow-ups start). | `STOP_COOLDOWN_BARS` |
+
+All guards are live in the backtest too (same code path), so the backtest
+numbers already include their cost/benefit. Every guard prints its explicit
+reason when it blocks an entry (`GUARD ...` lines, `signals` audit trail).
 
 ### Offline validation (no API, no network)
 
 ```bat
-python verify_all.py          REM 13 tests: indicators, fees, DB, strategy,
-                              REM broker, time, pipeline, precompute==raw,
-                              REM time-stop, tuner smoke, CSV import,
-                              REM full-session engine simulation w/ restart test
+python verify_all.py          REM 17 tests: indicators, fees, DB, strategy,
+                              REM broker, partial accounting, time, pipeline,
+                              REM precompute==raw, time-stop, tuner smoke,
+                              REM desk guards, tuner folds, objectives,
+                              REM CSV import, full-session engine simulation
+                              REM w/ restart test
 python test_engine_sim.py     REM just the full-session simulation w/ restart test
 ```
 
@@ -189,7 +235,7 @@ python patch.py reset --yes    REM wipe paper state + captured data (keeps keys)
 | `live_5m` | the bar in progress | transient, dropped when the bar finalises |
 | `daily_candles` | daily OHLCV | today's row written only after 15:35 |
 | `stock_context` | SMA20/SMA50/ATR14/avgVol/trend per day | built pre-open from strictly earlier days |
-| `trades` | every position (open + closed) with fees, P&L, reasons | **restart-safe positions** |
+| `trades` | every position (open + closed) with fees, P&L, reasons, **partials** (`qty_remaining`, `realized_pnl`, `partial_count`) | **restart-safe positions**, schema v2 (auto-migrated) |
 | `processed_bars` | (symbol, bar, kind) evaluated once | prevents double trading after restart |
 | `signals` | DIP / ENTRY / EXIT / TRAIL audit trail | |
 | `equity_curve` | mark-to-market equity per pass | |

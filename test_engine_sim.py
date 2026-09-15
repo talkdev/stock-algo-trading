@@ -218,6 +218,7 @@ assert daily_today == len(SYMS), "today's daily bar written post-close"
 assert list(config.REPORTS_DIR.glob("eod_*.md")), "EOD report missing"
 for t in closed:
     assert t["exit_time"][:10] == TODAY
-    assert t["exit_reason"] in ("STOP", "TARGET", "MEAN", "EOD", "DATA_END",
-                                "TIME")
+    assert t["exit_reason"] in ("STOP", "TARGET", "TARGET2", "MEAN", "EOD",
+                                "DATA_END", "TIME")
+    assert t["qty_remaining"] == 0, f"closed trade {t['id']} not fully settled"
 print("\nSIMULATION GREEN - restart-safe, flat at EOD, clean DB, EOD report written.")

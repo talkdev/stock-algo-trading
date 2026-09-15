@@ -177,6 +177,8 @@ class Strategy:
                                 f"{n.MIN_DAILY_AVG_VOLUME:,})")
         if now_hm and now_hm >= n.LAST_ENTRY_AT:
             return None, sigs, "after last-entry time"
+        if now_hm and now_hm < n.EARLY_ENTRY_CUTOFF:
+            return None, sigs, "pre-cutoff (opening noise)"
         if m["min_z"] > -n.DIP_Z:
             return None, sigs, "no dip in lookback"
         if m["min_rsi"] is not None and m["min_rsi"] > n.DIP_RSI:
@@ -190,6 +192,12 @@ class Strategy:
         b, pb = bars[-1], bars[-2]
         if not (b.c > b.o and b.c > pb.c):
             return None, sigs, "no green reclaim bar"
+        if n.MIN_BAR_CLOSE_POS > 0:
+            rng_ = b.h - b.l
+            cpos = 0.5 if rng_ < 1e-9 else (b.c - b.l) / rng_
+            if cpos < n.MIN_BAR_CLOSE_POS:
+                return None, sigs, (f"weak bar (close at {cpos:.0%} of range "
+                                    f"< {n.MIN_BAR_CLOSE_POS:.0%})")
         if m["rsi"] is not None and m["rsi"] > n.ENTRY_RSI_MAX:
             return None, sigs, f"RSI too hot ({m['rsi']:.1f} > {n.ENTRY_RSI_MAX})"
         if m["atr"] is None or m["atr"] <= 0:
@@ -201,6 +209,9 @@ class Strategy:
         if n.MIN_ATR_PCT > 0 and m["atr"] / b.c * 100 < n.MIN_ATR_PCT:
             return None, sigs, (f"too quiet (ATR {m['atr'] / b.c * 100:.3f}% "
                                 f"< {n.MIN_ATR_PCT}%)")
+        if n.MAX_ATR_PCT > 0 and m["atr"] / b.c * 100 > n.MAX_ATR_PCT:
+            return None, sigs, (f"event regime (ATR {m['atr'] / b.c * 100:.3f}% "
+                                f"> {n.MAX_ATR_PCT}%)")
         if n.DIP_MIN_DEPTH_ATR > 0 and m["depth"] < n.DIP_MIN_DEPTH_ATR * m["atr"]:
             return None, sigs, (f"dip too shallow ({m['depth']:.2f} < "
                                 f"{n.DIP_MIN_DEPTH_ATR}x ATR {m['atr']:.2f})")
@@ -319,6 +330,48 @@ class Strategy:
                     if ns > pos["stop"] + 1e-9:
                         new_stop = ns
         return None, new_stop
+
+    # ------------------------------------------------------- partial profits
+    def plan_target_exit(self, pos) -> dict:
+        """
+        Decide how to take profit when price reaches the mean target - the
+        classic MR money-maker:
+          * sell PARTIAL_PCT of the position at the mean (lock in reversion),
+          * move the stop to breakeven (free runner),
+          * let the remainder run to target-2 = entry + R_MULT * (entry-stop).
+        pos: mapping/dict/Row with qty, qty_remaining, partial_count,
+        entry_fill, stop, target. Returns:
+            {"action": "partial", "qty": q1, "new_stop": s, "target2": t2, ...}
+            {"action": "full", "qty": q_left, ...}
+        """
+        n = self.cfg
+        entry = pos["entry_fill"]
+        stop = pos["stop"]
+        left = _pget(pos, "qty_remaining", pos["qty"])
+        done = _pget(pos, "partial_count", 0)
+        if n.PARTIAL_PCT > 0 and done == 0 and left >= 2:
+            q1 = int(round(pos["qty"] * n.PARTIAL_PCT / 100.0))
+            q1 = max(1, min(q1, left - 1))
+            r = entry - stop
+            t2 = entry + r * n.R_MULT_TARGET2
+            ns = max(stop, entry) if n.BE_AFTER_PARTIAL else stop
+            note = (f"{q1} of {pos['qty']} sold at the mean; stop -> "
+                    + (f"breakeven {ns:.2f}; " if n.BE_AFTER_PARTIAL else "")
+                    + f"runner target {t2:.2f} ({n.R_MULT_TARGET2}R)")
+            return {"action": "partial", "qty": q1, "new_stop": ns,
+                    "target2": t2, "note": note}
+        return {"action": "full", "qty": left,
+                "note": "full close at mean" if done == 0
+                else "runner closed at second target"}
+
+
+def _pget(pos, key, default=None):
+    """Field access that works on both dicts and sqlite3.Row."""
+    try:
+        v = pos[key]
+        return default if v is None else v
+    except (TypeError, KeyError, IndexError):
+        return default
 
 
 def hm_of(dt) -> str:

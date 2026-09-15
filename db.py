@@ -20,7 +20,7 @@ import config
 from console import now_str
 from indicators import Bar
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (
@@ -67,10 +67,10 @@ CREATE TABLE IF NOT EXISTS signals (
 CREATE TABLE IF NOT EXISTS trades (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     symbol TEXT NOT NULL, source TEXT DEFAULT 'paper',
-    qty INTEGER NOT NULL,
+    qty INTEGER NOT NULL, qty_remaining INTEGER,
     entry_fill REAL, entry_time TEXT,
     stop REAL, target REAL, atr_entry REAL, peak_price REAL,
-    entry_fees REAL,
+    entry_fees REAL, realized_pnl REAL DEFAULT 0, partial_count INTEGER DEFAULT 0,
     exit_fill REAL, exit_time TEXT, exit_reason TEXT, exit_fees REAL,
     pnl_net REAL,
     detail_entry TEXT, detail_exit TEXT,
@@ -105,9 +105,32 @@ def get_conn(path: str | Path | None = None) -> sqlite3.Connection:
 
 def init_db(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
-    if get_meta(conn, "schema_version") is None:
+    _migrate(conn)
+    cur = get_meta(conn, "schema_version")
+    if cur is None or int(cur) < SCHEMA_VERSION:
         set_meta(conn, "schema_version", str(SCHEMA_VERSION))
     conn.commit()
+
+
+# idempotent column upgrades for databases created under older versions
+_MIGRATIONS = [
+    ("trades", "qty_remaining", "ALTER TABLE trades ADD COLUMN qty_remaining INTEGER"),
+    ("trades", "realized_pnl", "ALTER TABLE trades ADD COLUMN realized_pnl REAL DEFAULT 0"),
+    ("trades", "partial_count", "ALTER TABLE trades ADD COLUMN partial_count INTEGER DEFAULT 0"),
+]
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    cur = conn.execute("PRAGMA table_info(trades)")
+    have = {r[1] for r in cur.fetchall()}
+    for table, column, ddl in _MIGRATIONS:
+        if column not in have:
+            conn.execute(ddl)
+    # backfill qty_remaining for rows created before v2
+    if "qty_remaining" not in have:
+        conn.execute("UPDATE trades SET qty_remaining=qty WHERE qty_remaining IS NULL")
+    else:
+        conn.execute("UPDATE trades SET qty_remaining=qty WHERE qty_remaining IS NULL")
 
 
 # ---------------------------------------------------------------------------
@@ -276,9 +299,10 @@ def equity_at_or_before(conn, ts: str):
 def open_position(conn, symbol, source, qty, entry_fill, t, stop, target, atr_v,
                   entry_fees, detail, order_id) -> int:
     cur = conn.execute(
-        "INSERT INTO trades(symbol,source,qty,entry_fill,entry_time,stop,target,atr_entry,"
-        "entry_fees,detail_entry,order_buy,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
-        (symbol, source, int(qty), entry_fill, t, stop, target, atr_v,
+        "INSERT INTO trades(symbol,source,qty,qty_remaining,entry_fill,entry_time,"
+        "stop,target,atr_entry,entry_fees,detail_entry,order_buy,created_at) "
+        "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (symbol, source, int(qty), int(qty), entry_fill, t, stop, target, atr_v,
          entry_fees, detail, order_id, now_str()),
     )
     return int(cur.lastrowid)
@@ -295,7 +319,8 @@ def get_open_positions(conn) -> list:
 
 
 def update_position(conn, pid: int, **fields) -> None:
-    allowed = {"stop", "target", "peak_price", "sl_order", "order_buy", "order_sell"}
+    allowed = {"stop", "target", "peak_price", "sl_order", "order_buy", "order_sell",
+               "qty_remaining", "realized_pnl", "partial_count", "exit_fees"}
     sets, args = [], []
     for k, v in fields.items():
         if k in allowed:
@@ -305,17 +330,43 @@ def update_position(conn, pid: int, **fields) -> None:
         conn.execute(f"UPDATE trades SET {', '.join(sets)} WHERE id=?", *args, pid)
 
 
-def close_position(conn, pid: int, exit_fill, t, reason, exit_fees, detail, order_id) -> None:
+def sell_partial(conn, pid: int, qty: int, exit_fill, t, reason, exit_fees, detail) -> float:
+    """Close `qty` shares of an open position, keep the rest.
+    Returns the realized P&L contribution of this slice (net of its fees).
+    pnl_net stays NULL until the position is fully closed."""
+    p = get_position(conn, pid)
+    if not p or p["exit_time"]:
+        raise ValueError(f"trade {pid} not open")
+    qty = int(qty)
+    left = p["qty_remaining"] if p["qty_remaining"] is not None else p["qty"]
+    if qty <= 0 or qty > left:
+        raise ValueError(f"partial qty {qty} invalid (remaining {left})")
+    realized = (exit_fill - p["entry_fill"]) * qty - exit_fees
     conn.execute(
-        "UPDATE trades SET exit_fill=?, exit_time=?, exit_reason=?, exit_fees=?, "
-        "pnl_net=?, detail_exit=?, order_sell=?, closed_at=? WHERE id=?",
-        (exit_fill, t, reason, exit_fees,
-         (exit_fill - None) if False else None, detail, order_id, now_str(), pid),
+        "UPDATE trades SET qty_remaining=?, realized_pnl=COALESCE(realized_pnl,0)+?, "
+        "exit_fees=COALESCE(exit_fees,0)+?, partial_count=COALESCE(partial_count,0)+1 "
+        "WHERE id=?",
+        (left - qty, realized, exit_fees, pid),
     )
-    # compute pnl_net in python to keep it simple and explicit
-    p = conn.execute("SELECT qty, entry_fill, entry_fees FROM trades WHERE id=?", (pid,)).fetchone()
-    pnl = (exit_fill - p["entry_fill"]) * p["qty"] - p["entry_fees"] - exit_fees
-    conn.execute("UPDATE trades SET pnl_net=? WHERE id=?", (pnl, pid))
+    return realized
+
+
+def close_position(conn, pid: int, exit_fill, t, reason, exit_fees, detail, order_id) -> None:
+    """Close the REMAINING shares of a position and settle pnl_net."""
+    p = get_position(conn, pid)
+    if not p or p["exit_time"]:
+        return
+    qty = p["qty_remaining"] if p["qty_remaining"] is not None else p["qty"]
+    realized = (exit_fill - p["entry_fill"]) * qty - exit_fees
+    # entry fees were paid up front - settle them here so pnl_net nets out
+    # ALL costs (partial slices already net of their own exit fees)
+    total = (p["realized_pnl"] or 0.0) + realized - (p["entry_fees"] or 0.0)
+    conn.execute(
+        "UPDATE trades SET exit_fill=?, exit_time=?, exit_reason=?, "
+        "exit_fees=COALESCE(exit_fees,0)+?, pnl_net=?, qty_remaining=0, "
+        "detail_exit=?, order_sell=?, closed_at=? WHERE id=?",
+        (exit_fill, t, reason, exit_fees, total, detail, order_id, now_str(), pid),
+    )
 
 
 def trades_in_range(conn, start: str, end: str, source: str | None = None) -> list:

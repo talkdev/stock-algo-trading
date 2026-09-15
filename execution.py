@@ -82,7 +82,8 @@ class PaperBroker:
         mv = 0.0
         for p in db.get_open_positions(self.conn):
             px = last_prices.get(p["symbol"], p["entry_fill"]) or p["entry_fill"]
-            mv += p["qty"] * px
+            qty = p["qty_remaining"] if p["qty_remaining"] is not None else p["qty"]
+            mv += qty * px
         return c, c + mv
 
     # -- orders --
@@ -98,16 +99,36 @@ class PaperBroker:
         self.conn.commit()
         return pid
 
-    def sell(self, pid, price, t, reason, detail) -> float | None:
+    def sell_partial(self, pid, price, qty, t, reason, detail) -> float | None:
+        """Close `qty` shares, keep the rest running. Returns realized P&L
+        (net of fees) of this slice."""
         p = db.get_position(self.conn, pid)
         if not p or p["exit_time"]:
             return None
+        left = p["qty_remaining"] if p["qty_remaining"] is not None else p["qty"]
+        qty = min(int(qty), left)
         fill = slip(price, "SELL")
-        fees = compute_fees("SELL", fill, p["qty"])
-        self._set_cash(self.cash() + (fill * p["qty"] - fees["total"]))
+        fees = compute_fees("SELL", fill, qty)
+        self._set_cash(self.cash() + (fill * qty - fees["total"]))
+        realized = db.sell_partial(self.conn, pid, qty, fill, t, reason,
+                                   fees["total"], detail)
+        self.conn.commit()
+        return realized
+
+    def sell(self, pid, price, t, reason, detail) -> float | None:
+        """Close the REMAINING shares and settle the trade's total pnl_net
+        (including any earlier partial profits)."""
+        p = db.get_position(self.conn, pid)
+        if not p or p["exit_time"]:
+            return None
+        qty = p["qty_remaining"] if p["qty_remaining"] is not None else p["qty"]
+        fill = slip(price, "SELL")
+        fees = compute_fees("SELL", fill, qty)
+        self._set_cash(self.cash() + (fill * qty - fees["total"]))
         db.close_position(self.conn, pid, fill, t, reason, fees["total"], detail, None)
         self.conn.commit()
-        return (fill - p["entry_fill"]) * p["qty"] - p["entry_fees"] - fees["total"]
+        return ((p["realized_pnl"] or 0.0) + (fill - p["entry_fill"]) * qty
+                - fees["total"] - (p["entry_fees"] or 0.0))
 
 
 # ---------------------------------------------------------------------------
@@ -155,6 +176,24 @@ class UpstoxBroker:
         self.conn.commit()
         return pid
 
+    def sell_partial(self, pid, price, qty, t, reason, detail) -> float | None:
+        p = db.get_position(self.conn, pid)
+        if not p or p["exit_time"]:
+            return None
+        key = self.keys.get(p["symbol"])
+        if not key:
+            return None
+        left = p["qty_remaining"] if p["qty_remaining"] is not None else p["qty"]
+        qty = min(int(qty), left)
+        oid = self.client.place_order(key, qty, "SELL")
+        d = self.client.wait_fill(oid)
+        fill = float(d.get("average_trade_price") or price)
+        fees = compute_fees("SELL", fill, qty)
+        realized = db.sell_partial(self.conn, pid, qty, fill, t, reason,
+                                   fees["total"], detail)
+        self.conn.commit()
+        return realized
+
     def sell(self, pid, price, t, reason, detail) -> float | None:
         p = db.get_position(self.conn, pid)
         if not p or p["exit_time"]:
@@ -162,10 +201,11 @@ class UpstoxBroker:
         key = self.keys.get(p["symbol"])
         if not key:
             return None
-        oid = self.client.place_order(key, p["qty"], "SELL")
+        qty = p["qty_remaining"] if p["qty_remaining"] is not None else p["qty"]
+        oid = self.client.place_order(key, qty, "SELL")
         d = self.client.wait_fill(oid)
         fill = float(d.get("average_trade_price") or price)
-        fees = compute_fees("SELL", fill, p["qty"])
+        fees = compute_fees("SELL", fill, qty)
         if p["sl_order"]:
             try:
                 self.client.cancel_order(p["sl_order"])
@@ -173,4 +213,5 @@ class UpstoxBroker:
                 pass
         db.close_position(self.conn, pid, fill, t, reason, fees["total"], detail, oid)
         self.conn.commit()
-        return (fill - p["entry_fill"]) * p["qty"] - p["entry_fees"] - fees["total"]
+        return ((p["realized_pnl"] or 0.0) + (fill - p["entry_fill"]) * qty
+                - fees["total"] - (p["entry_fees"] or 0.0))

@@ -354,6 +354,199 @@ def test_tuner_smoke():
             assert "cagr" in r["train"]
 
 
+def test_partial_accounting():
+    """Partial profit-taking: db slice math + broker cash/pnl identity."""
+    with tempfile.TemporaryDirectory() as td:
+        conn = db.get_conn(os.path.join(td, "t.db"))
+        db.init_db(conn)
+        t0 = "2026-09-14 10:00:00"
+        pid = db.open_position(conn, "X", "paper", 100, 100.0, t0, 99.0,
+                               101.0, 0.5, 5.0, "test", None)
+        # slice 1: 50 of 100 @ 101, exit fees 2 -> 1.0*50 - 2 = 48
+        r = db.sell_partial(conn, pid, 50, 101.0, "2026-09-14 10:30:00",
+                            "PARTIAL", 2.0, "50% at mean")
+        assert abs(r - 48.0) < 1e-9
+        p = db.get_position(conn, pid)
+        assert p["qty_remaining"] == 50 and p["partial_count"] == 1
+        assert abs(p["realized_pnl"] - 48.0) < 1e-9
+        # slice 2: remaining 50 @ 102, exit fees 3, entry fees settled here
+        db.close_position(conn, pid, 102.0, "2026-09-14 11:00:00", "TARGET2",
+                          3.0, "runner", None)
+        p = db.get_position(conn, pid)
+        assert p["qty_remaining"] == 0 and p["exit_reason"] == "TARGET2"
+        assert abs(p["pnl_net"] - (48.0 + 2.0 * 50 - 3.0 - 5.0)) < 1e-9
+
+        # broker level: final cash must equal start + pnl_net (all costs net)
+        conn2 = db.get_conn(os.path.join(td, "b.db"))
+        db.init_db(conn2)
+        b = PaperBroker(conn2)
+        c0 = b.cash()
+        fill_b = slip(100.0, "BUY")
+        pid2 = b.buy("X", 100.0, 100, t0, 99.0, 101.0, 0.5, "t")
+        assert pid2
+        r2 = b.sell_partial(pid2, 101.0, 50, "2026-09-14 10:30:00",
+                            "PARTIAL", "50% at mean")
+        assert r2 is not None and 0 < r2 < 1.0 * 50  # net of its own fees
+        fee_p = compute_fees("SELL", slip(101.0, "SELL"), 50)["total"]
+        c_mid = b.cash()
+        expect_mid = (c0 - (fill_b * 100
+                            + compute_fees("BUY", fill_b, 100)["total"])
+                      + slip(101.0, "SELL") * 50 - fee_p)
+        assert abs(c_mid - expect_mid) < 1e-6
+        pnl = b.sell(pid2, 102.0, "2026-09-14 11:00:00", "TARGET2", "runner")
+        p2 = db.get_position(conn2, pid2)
+        assert abs(pnl - p2["pnl_net"]) < 1e-9, "broker pnl must match db"
+        assert abs(b.cash() - (c0 + p2["pnl_net"])) < 1e-6, \
+            "cash identity: start + net pnl"
+
+
+def test_desk_guards():
+    """Entry guards (strategy level) + desk guards (engine level)."""
+    from engine import Engine
+    bars = _dip_bars()
+
+    def find_reclaim(strat):
+        for i in range(45, len(bars)):
+            plan, _s, _sk = strat.evaluate_entry("X", CTX_UP, bars[: i + 1],
+                                                 now_hm="12:30", equity=1e6,
+                                                 cash=1e6)
+            if plan:
+                return i, plan
+        return None, None
+
+    base = Strategy()
+    entry_idx, _plan = find_reclaim(base)
+    assert entry_idx is not None, "fixture must produce a reclaim entry"
+
+    # 1) early-entry cutoff: before the cutoff -> blocked, after -> entry
+    s_cut = Strategy(config.make_cfg({"EARLY_ENTRY_CUTOFF": "13:00"}))
+    _p, _s, skip = s_cut.evaluate_entry("X", CTX_UP, bars[: entry_idx + 1],
+                                        now_hm="12:30", equity=1e6, cash=1e6)
+    assert skip == "pre-cutoff (opening noise)", skip
+    p, _s, skip = s_cut.evaluate_entry("X", CTX_UP, bars[: entry_idx + 1],
+                                       now_hm="13:30", equity=1e6, cash=1e6)
+    assert p is not None, f"same setup must pass after cutoff (got {skip!r})"
+
+    # 2) event-regime ATR cap (impossible cap -> always 'event regime')
+    s_ev = Strategy(config.make_cfg({"MAX_ATR_PCT": 0.0001}))
+    _p, _s, skip = s_ev.evaluate_entry("X", CTX_UP, bars[: entry_idx + 1],
+                                       now_hm="12:30", equity=1e6, cash=1e6)
+    assert skip and "event regime" in skip, skip
+
+    # 3) weak entry bar (unachievable close-position -> always 'weak bar';
+    #    the fixture's reclaim bar closes exactly at its high, cpos == 1.0)
+    s_w = Strategy(config.make_cfg({"MIN_BAR_CLOSE_POS": 1.0001}))
+    _p, _s, skip = s_w.evaluate_entry("X", CTX_UP, bars[: entry_idx + 1],
+                                      now_hm="12:30", equity=1e6, cash=1e6)
+    assert skip and "weak bar" in skip, skip
+
+    # 4) partial profit plan: half at the mean, breakeven stop, 1.5R runner
+    s_p = Strategy(config.make_cfg({"PARTIAL_PCT": 50.0,
+                                    "R_MULT_TARGET2": 1.5,
+                                    "BE_AFTER_PARTIAL": True}))
+    pos = {"symbol": "X", "qty": 100, "qty_remaining": 100,
+           "entry_fill": 100.0, "stop": 99.0, "target": 101.0,
+           "partial_count": 0}
+    act = s_p.plan_target_exit(pos)
+    assert act["action"] == "partial" and act["qty"] == 50
+    assert abs(act["new_stop"] - 100.0) < 1e-9      # breakeven
+    assert abs(act["target2"] - 101.5) < 1e-9       # 1.5R runner
+    pos2 = dict(pos, qty_remaining=50, partial_count=1)
+    assert s_p.plan_target_exit(pos2)["action"] == "full"
+    s_off = Strategy(config.make_cfg({"PARTIAL_PCT": 0.0}))
+    assert s_off.plan_target_exit(pos)["action"] == "full"
+
+    # 5) engine-level desk guards (trade cap, stop cooldown, kill-switch)
+    with tempfile.TemporaryDirectory() as td:
+        path = os.path.join(td, "g.db")
+        eng = Engine(mode="paper", db_path=path, quiet=True)
+        date = "2026-09-14"
+
+        def ins(sym, entry, exit_time, reason):
+            eng.conn.execute(
+                "INSERT INTO trades(symbol,source,qty,qty_remaining,"
+                "entry_fill,entry_time,stop,target,exit_fill,exit_time,"
+                "exit_reason,pnl_net) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+                (sym, "paper", 10, 0, 100.0, entry, 99.0, 101.0, 100.5,
+                 exit_time, reason, 1.0))
+            eng.conn.commit()
+
+        cap = eng.cfg.MAX_TRADES_PER_DAY
+        for i in range(cap):
+            ins(f"S{i}", f"{date} 10:{i:02d}:00", f"{date} 10:{i:02d}:01",
+                "MEAN")
+        assert eng._entry_blocked(date, "X", f"{date} 13:00:00") == "trade-cap"
+
+        eng.conn.execute("DELETE FROM trades"); eng.conn.commit()
+        ins("X", f"{date} 13:00:00", f"{date} 13:04:00", "STOP")
+        assert eng._entry_blocked(date, "X", f"{date} 13:15:00") == "cooldown"
+        assert eng._entry_blocked(date, "X", f"{date} 13:35:00") is None
+
+        eng.conn.execute("DELETE FROM trades"); eng.conn.commit()
+        eng._halted = True
+        assert eng._entry_blocked(date, "X", f"{date} 13:00:00") == "loss-limit"
+
+
+def test_tuner_folds():
+    """Anchored walk-forward fold construction + multi-fold optimize rows."""
+    import demo_data
+    import tune
+    days = [f"2026-09-{d:02d}" for d in (1, 2, 3, 4, 7, 8, 9, 10, 11, 14,
+                                         15, 16, 17, 18, 19)]
+    fs = tune.build_folds(days, 3, 0.7)
+    assert len(fs) == 3
+    lens = [len(tr) for tr, _ in fs]
+    assert lens == sorted(lens) and lens[0] >= 2, "train windows must expand"
+    assert all(len(te) >= 1 for _tr, te in fs)
+    assert fs[-1][1][-1] == days[-1], "last fold must end on the final day"
+    assert fs[-1][0][-1] < fs[-1][1][0], "train/test must not overlap"
+
+    with tempfile.TemporaryDirectory() as td:
+        conn = db.get_conn(os.path.join(td, "t.db"))
+        db.init_db(conn)
+        syms = config.load_universe()[:8]
+        demo_data.seed_demo(conn, days=8, symbols=syms, seed=5, quiet=True)
+        dd = db.distinct_dates(conn, "2000-01-01", "9999-12-31")
+        grid = {"DIP_Z": [1.0, 1.5], "USE_VWAP_FILTER": [False],
+                "TIME_STOP_BARS": [0]}
+        try:
+            res = tune.optimize(conn, dd, syms, 1e6, grid, n_samples=4,
+                                top_k=2, seed=1, split=0.6, min_trades=1,
+                                max_dd=50.0, folds=2, objective="calmar",
+                                quiet=True)
+        except SystemExit as e:
+            if "no combination passed" in str(e):
+                print("    (no combo passed the strict filter - valid outcome)")
+                return
+            raise
+        assert res
+        for r in res:
+            assert len(r["fold_tests"]) == 2, "two fold slices per combo"
+            assert "mean_obj" in r and "z_train" in r and "eligible" in r
+            assert any(rr["tag"] == "base" for rr in res)
+
+
+def test_objectives():
+    """Objective scalars: pnl / cagr / calmar / sharpe + undefined handling."""
+    import tune
+    st = {"net_pnl": 1000.0, "cagr": 0.10, "max_dd_pct": 0.05,
+          "sharpe": 2.5, "n_trades": 10, "win_rate": 60.0,
+          "avg_hold_bars": 4.0}
+    assert tune.objective_val(st, "pnl") == 1000.0
+    assert tune.objective_val(st, "cagr") == 0.10
+    assert abs(tune.objective_val(st, "calmar") - 200.0) < 1e-9  # 10/0.05
+    assert tune.objective_val(st, "sharpe") == 2.5
+    empty = {"net_pnl": 0.0, "cagr": None, "max_dd_pct": 0.0, "sharpe": None,
+             "n_trades": 0, "win_rate": 0.0, "avg_hold_bars": 0.0}
+    assert tune.objective_val(empty, "cagr") <= -1e8
+    assert tune.objective_val(empty, "calmar") <= -1e8
+    assert tune.objective_val(empty, "sharpe") <= -1e8
+    assert tune.eligible(st, 10, 3.0, min_wr=60, max_hold=4)
+    assert not tune.eligible(st, 11, 3.0)                 # too few trades
+    assert not tune.eligible(st, 10, 0.04)                # DD over limit
+    assert not tune.eligible(st, 10, 3.0, min_wr=61)      # win rate under
+
+
 def test_import_csv():
     import data_import
     with tempfile.TemporaryDirectory() as td:
@@ -411,6 +604,8 @@ def main() -> int:
           test_db_roundtrip)
     check("strategy: dip -> entry -> mean exit (+guards)", test_strategy_entry_exit)
     check("paper broker round-trip (cash & pnl)", test_paper_broker)
+    check("partial profit-taking accounting (db + broker identity)",
+          test_partial_accounting)
     check("market-time helpers (phases, boundaries)", test_mkttime)
     check("full pipeline: demo seed -> backtest -> report -> purge",
           test_full_pipeline)
@@ -420,6 +615,10 @@ def main() -> int:
           test_time_stop)
     check("tuner: walk-forward smoke (train/test, base row, CAGR)",
           test_tuner_smoke)
+    check("desk guards (cutoff, event ATR, weak bar, partials, engine gates)",
+          test_desk_guards)
+    check("tuner: anchored folds + multi-fold rows", test_tuner_folds)
+    check("tuner: objective scalars + eligibility", test_objectives)
     check("csv import: 5m + daily, idempotent re-import", test_import_csv)
     check("engine simulation: full session + restart safety (mock API)",
           test_engine_simulation)

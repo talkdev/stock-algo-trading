@@ -48,7 +48,13 @@ def show_status(db_path) -> int:
     cash = float(db.get_meta(conn, "paper_cash", config.PAPER_START_EQUITY))
     start_eq = float(db.get_meta(conn, "paper_start_equity",
                                  config.PAPER_START_EQUITY))
-    mv = sum(p["qty"] * lp.get(p["symbol"], p["entry_fill"]) for p in pos)
+    def held(p):
+        try:
+            return p["qty_remaining"] if p["qty_remaining"] is not None else p["qty"]
+        except (IndexError, KeyError):
+            return p["qty"]
+
+    mv = sum(held(p) * lp.get(p["symbol"], p["entry_fill"]) for p in pos)
     equity = cash + mv
     realized_today = db.closed_pnl_on(conn, today)
 
@@ -64,11 +70,11 @@ def show_status(db_path) -> int:
     if pos:
         print("  open positions:")
         table(["sym", "qty", "entry", "time", "stop", "target", "last", "uP&L"],
-              [[p["symbol"], p["qty"], f"{p['entry_fill']:.2f}",
+              [[p["symbol"], held(p), f"{p['entry_fill']:.2f}",
                 p["entry_time"][11:16], f"{p['stop']:.2f}", f"{p['target']:.2f}",
                 f"{lp.get(p['symbol'], p['entry_fill']):.2f}",
                 signed((lp.get(p["symbol"], p["entry_fill"]) - p["entry_fill"])
-                       * p["qty"])]
+                       * held(p))]
                for p in pos],
               aligns=["l", "r", "r", "l", "r", "r", "r", "r"])
     else:

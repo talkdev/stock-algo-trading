@@ -96,6 +96,12 @@ def run_backtest(conn, start: str, end: str, symbols: list[str],
                 }) if c else None
             ctx_by_sym[s] = ctx
 
+        # ---- desk guards, reset each day (same rules as the live engine) ---
+        halted = False
+        n_trades_today = 0
+        cooldown: dict[str, int] = {}
+        day_start_equity: float | None = None
+
         for i in range(n_bars):
             t_str = (times[i].strftime("%Y-%m-%d %H:%M:%S")
                      if i < len(times) else None)
@@ -120,26 +126,59 @@ def run_backtest(conn, start: str, end: str, symbols: list[str],
                     pre=pre_i.get(s), bars_held=pos.get("held", 0))
                 if call is None:
                     pos["held"] = pos.get("held", 0) + 1
-                if call:
-                    fill = slip(call.price, "SELL")
-                    fees = compute_fees("SELL", fill, pos["qty"])
-                    pnl = ((fill - pos["entry_fill"]) * pos["qty"]
-                           - pos["fees_buy"] - fees["total"])
-                    cash += fill * pos["qty"] - fees["total"]
-                    realized += pnl
-                    rec = dict(pos)
-                    rec.update({"exit_fill": fill, "exit_time": b.t,
-                                "exit_reason": call.reason,
-                                "exit_fees": fees["total"], "pnl_net": pnl,
-                                "exit_note": call.note, "day": day})
-                    trades.append(rec)
-                    del positions[s]
-                    if not quiet:
-                        print(f"  [{day} {b.t[11:16]}] EXIT  {s:<11} "
-                              f"SELL {pos['qty']} @ {fill:.2f}  "
-                              f"reason: {call.reason:<8} pnl {signed(pnl)}")
-                elif new_stop > pos["stop"] + 1e-9:
-                    pos["stop"] = new_stop  # trail (in-place, persisted per-day only)
+                    if new_stop > pos["stop"] + 1e-9:
+                        pos["stop"] = new_stop  # trail
+                    continue
+
+                # TARGET: partial take-profit + breakeven + runner target-2
+                if call.reason == "TARGET":
+                    act = strat.plan_target_exit({
+                        "qty": pos["qty"], "qty_remaining": pos["qty_left"],
+                        "partial_count": pos["partial"],
+                        "entry_fill": pos["entry_fill"], "stop": pos["stop"],
+                        "target": pos["target"]})
+                    if act["action"] == "partial":
+                        q1 = act["qty"]
+                        fill = slip(call.price, "SELL")
+                        fees = compute_fees("SELL", fill, q1)
+                        cash += fill * q1 - fees["total"]
+                        pos["realized"] += (fill - pos["entry_fill"]) * q1 \
+                            - fees["total"]
+                        pos["qty_left"] -= q1
+                        pos["partial"] += 1
+                        pos["stop"] = max(pos["stop"], act["new_stop"])
+                        pos["target"] = act["target2"]
+                        if not quiet:
+                            print(f"  [{day} {b.t[11:16]}] PART {s:<11} "
+                                  f"SELL {q1} (of {pos['qty']}) @ {fill:.2f}  "
+                                  f"50%-at-mean rule: stop {pos['stop']:.2f}, "
+                                  f"T2 {pos['target']:.2f}")
+                        continue
+
+                qty = pos["qty_left"]
+                fill = slip(call.price, "SELL")
+                fees = compute_fees("SELL", fill, qty)
+                pnl = pos["realized"] + (fill - pos["entry_fill"]) * qty \
+                    - fees["total"]
+                cash += fill * qty - fees["total"]
+                realized += pnl
+                reason = ("TARGET2"
+                          if call.reason == "TARGET" and pos["partial"] > 0
+                          else call.reason)
+                note = call.note + (f" | partials: {pos['partial']}"
+                                    if pos["partial"] else "")
+                rec = dict(pos)
+                rec.update({"exit_fill": fill, "exit_time": b.t,
+                            "exit_reason": reason, "exit_fees": fees["total"],
+                            "pnl_net": pnl, "exit_note": note, "day": day})
+                trades.append(rec)
+                del positions[s]
+                if reason == "STOP" and cfg.STOP_COOLDOWN_BARS > 0:
+                    cooldown[s] = i + cfg.STOP_COOLDOWN_BARS
+                if not quiet:
+                    print(f"  [{day} {b.t[11:16]}] EXIT  {s:<11} "
+                          f"SELL {qty} @ {fill:.2f}  "
+                          f"reason: {reason:<8} pnl {signed(pnl)}")
 
             # ---------------- entries --------------------------------------
             if len(positions) < cfg.MAX_POSITIONS:
@@ -147,11 +186,17 @@ def run_backtest(conn, start: str, end: str, symbols: list[str],
                     bs = bars_by_sym[s]
                     if i < cfg.WARMUP_BARS - 1 or i >= len(bs) or s in positions:
                         continue
+                    # desk guards: daily loss kill-switch, overtrade cap,
+                    # post-stop cooldown
+                    if halted or n_trades_today >= cfg.MAX_TRADES_PER_DAY:
+                        break
+                    if s in cooldown and i < cooldown[s]:
+                        continue
                     b = bs[i]
                     plan, sigs, skip = strat.evaluate_entry(
                         s, ctx_by_sym.get(s), bs[: i + 1],
                         now_hm=b.t[11:16],
-                        equity=cash + sum(p["qty"] * bars_by_sym[p["symbol"]][i].c
+                        equity=cash + sum(p["qty_left"] * bars_by_sym[p["symbol"]][i].c
                                           for p in positions.values()
                                           if i < len(bars_by_sym[p["symbol"]])),
                         cash=cash, pre=pre_i.get(s))
@@ -163,12 +208,14 @@ def run_backtest(conn, start: str, end: str, symbols: list[str],
                     if cost > cash:
                         continue
                     cash -= cost
+                    n_trades_today += 1
                     positions[s] = {
-                        "symbol": s, "qty": plan.qty, "entry_fill": fill,
-                        "entry_time": b.t, "stop": plan.stop, "target": plan.target,
+                        "symbol": s, "qty": plan.qty, "qty_left": plan.qty,
+                        "entry_fill": fill, "entry_time": b.t,
+                        "stop": plan.stop, "target": plan.target,
                         "atr_entry": plan.atr, "fees_buy": fees["total"],
                         "entry_note": plan.reason, "z": plan.z, "day": day,
-                        "held": 0,
+                        "held": 0, "realized": 0.0, "partial": 0,
                     }
                     if not quiet:
                         print(f"  [{day} {b.t[11:16]}] ENTRY {s:<11} "
@@ -179,7 +226,7 @@ def run_backtest(conn, start: str, end: str, symbols: list[str],
             mv = 0.0
             for s, pos in positions.items():
                 if i < len(bars_by_sym[s]):
-                    mv += pos["qty"] * bars_by_sym[s][i].c
+                    mv += pos["qty_left"] * bars_by_sym[s][i].c
             ts = t_str
             if ts is None:
                 for s2, b2 in bars_by_sym.items():
@@ -187,18 +234,30 @@ def run_backtest(conn, start: str, end: str, symbols: list[str],
                         ts = b2[i].t
                         break
                 ts = ts or day
-            equity_pts.append((ts, cash + mv, cash, len(positions), realized))
+            equity = cash + mv
+            equity_pts.append((ts, equity, cash, len(positions), realized))
+            if day_start_equity is None:
+                day_start_equity = equity
+            elif (cfg.DAILY_LOSS_LIMIT_PCT > 0 and not halted
+                  and equity <= day_start_equity *
+                  (1 - cfg.DAILY_LOSS_LIMIT_PCT / 100.0)):
+                halted = True
+                if not quiet:
+                    print(f"  [{day} {b.t[11:16]}] DESK  daily loss limit "
+                          f"-{cfg.DAILY_LOSS_LIMIT_PCT}% hit - no more entries "
+                          f"today (kill-switch)")
 
         # safety: anything still open (shouldn't happen - EOD rule closes)
         for s, pos in list(positions.items()):
             bs = bars_by_sym[s]
             if bs:
                 b = bs[-1]
+                qty = pos["qty_left"]
                 fill = slip(b.c, "SELL")
-                fees = compute_fees("SELL", fill, pos["qty"])
-                pnl = ((fill - pos["entry_fill"]) * pos["qty"]
-                       - pos["fees_buy"] - fees["total"])
-                cash += fill * pos["qty"] - fees["total"]
+                fees = compute_fees("SELL", fill, qty)
+                pnl = pos["realized"] + (fill - pos["entry_fill"]) * qty \
+                    - fees["total"]
+                cash += fill * qty - fees["total"]
                 realized += pnl
                 rec = dict(pos)
                 rec.update({"exit_fill": fill, "exit_time": b.t,
@@ -393,7 +452,8 @@ def write_report(res: dict, path) -> None:
     L.append("|-----|--------|-----|-------|------|--------|---------|-------------|")
     for t in res["trades"]:
         note = (t.get("entry_note") or "").replace("|", "/")[:90]
-        L.append(f"| {t['day']} | {t['symbol']} | {t['qty']} | "
+        part = f" ({t['qty']}, {t.get('partial', 0)} partials)" if t.get("partial") else f" ({t['qty']})"
+        L.append(f"| {t['day']} | {t['symbol']} |{part} | "
                  f"{t['entry_fill']:.2f} @ {t['entry_time'][11:16]} | "
                  f"{t['exit_fill']:.2f} @ {t['exit_time'][11:16]} | "
                  f"{t['exit_reason']} | {signed(t['pnl_net'])} | {note} |")
@@ -404,11 +464,13 @@ def write_trades_csv(res: dict, path) -> None:
     import csv
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["day", "symbol", "qty", "entry_time", "entry_fill",
-                    "stop", "target", "exit_time", "exit_fill", "exit_reason",
-                    "entry_fees", "exit_fees", "pnl_net", "entry_note"])
+        w.writerow(["day", "symbol", "qty", "partials", "entry_time",
+                    "entry_fill", "stop", "target", "exit_time", "exit_fill",
+                    "exit_reason", "entry_fees", "exit_fees", "pnl_net",
+                    "entry_note"])
         for t in res["trades"]:
-            w.writerow([t["day"], t["symbol"], t["qty"], t["entry_time"],
+            w.writerow([t["day"], t["symbol"], t["qty"], t.get("partial", 0),
+                        t["entry_time"],
                         f"{t['entry_fill']:.2f}", f"{t['stop']:.2f}",
                         f"{t['target']:.2f}", t["exit_time"],
                         f"{t['exit_fill']:.2f}", t["exit_reason"],

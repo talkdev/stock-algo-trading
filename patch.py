@@ -29,8 +29,15 @@ def cmd_status(conn) -> int:
     open_pos = db.get_open_positions(conn)
     print(f"\n  open positions : {len(open_pos)}")
     for p in open_pos:
-        print(f"    {p['symbol']:<12} {p['qty']:>5} @ {p['entry_fill']:.2f} "
-              f"({p['entry_time']})  stop {p['stop']:.2f}  target {p['target']:.2f}")
+        try:
+            rem = p["qty_remaining"] if p["qty_remaining"] is not None else p["qty"]
+            pc = p["partial_count"] or 0
+        except (IndexError, KeyError):
+            rem, pc = p["qty"], 0
+        part = f"  [{pc} partial(s), realized {p['realized_pnl']:+.2f}]" if pc else ""
+        print(f"    {p['symbol']:<12} {rem:>5} @ {p['entry_fill']:.2f} "
+              f"({p['entry_time']})  stop {p['stop']:.2f}  target {p['target']:.2f}"
+              f"{part}")
     last = conn.execute("SELECT MAX(bar_time) AS m FROM candles_5m").fetchone()
     first = conn.execute("SELECT MIN(bar_time) AS m FROM candles_5m").fetchone()
     print(f"\n  bar window     : {first['m'] if first else '-'}  ..  "
