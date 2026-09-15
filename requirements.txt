@@ -1,7 +1,4 @@
-numpy>=1.26
-pandas>=2.0
-scipy>=1.11
+# STMR - short-term mean reversion (intraday, NSE cash, long-only)
+# Deliberately light: indicators are pure Python (no numpy/pandas needed).
 requests>=2.31
-statsmodels>=0.14      
-arch>=6.0              
-tzdata>=2023.3         
+tzdata>=2023.3        # IANA timezones (required on Windows for zoneinfo)
